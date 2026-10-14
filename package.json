@@ -1,0 +1,9 @@
+{
+  "name": "saaya-telegram-bot",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": { "start": "node src/index.js", "check": "node --check src/index.js" },
+  "engines": { "node": ">=20" },
+  "dependencies": { "telegraf": "^4.16.3" }
+}
