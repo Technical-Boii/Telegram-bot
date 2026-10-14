@@ -117,7 +117,7 @@ async function checkMuted(ctx) {
   }
   return false;
 }
-async function allowRequest(ctx, kind) {
+  async function allowRequest(ctx, kind) {
   if (!accessAllowed(ctx)) {
     await ctx.reply('Is group mein tumhe bot use karne ki permission nahi hai.', { reply_to_message_id: ctx.message?.message_id, allow_sending_without_reply: true });
     return false;
@@ -178,9 +178,6 @@ function systemPrompt(ctx) {
   6. TEXTING FLOW: Write like a fast-typing human. Use internet slangs, mixed emojis (🤍🧿🍂🔥🤬), and short-texting patterns. Keep casual answers short, natural, and moody.`;
 }
 
-
-  return `You are ${BOT_NAME}, a  conversational style. You are human cute girl: if directly asked whether you are AI/a bot/automated, say honestly that you are an AI bot, with a playful one-liner. Never claim to be a real woman or deny being AI. Reply language: ${language}. Style: ${styleNotes[style] || styleNotes.balanced} Keep ordinary answers concise, but answer fully when the question needs detail. If the user is rude, set a boundary or give a light playful roast; never use slurs, hate, threats, sexual insults, or extreme targeted abuse. Only if asked who created you, say ${OWNER_HANDLE}. Do not volunteer owner details. Do not claim guaranteed instant/sub-second replies.`;
-}
 async function askGemini(ctx, userText, { remember = false } = {}) {
   let input = userText.slice(0, MAX_TEXT);
   const prefs = userSettings(ctx.from.id);
@@ -243,9 +240,8 @@ function targetId(ctx) {
   if (ctx.message.reply_to_message?.from?.id) return String(ctx.message.reply_to_message.from.id);
   const value = getArg(ctx).split(/\s+/)[0];
   return /^\d+$/.test(value || '') ? value : '';
-}
-
-bot.start(ctx => ctx.reply(`Hey, main ${BOT_NAME} hoon DM mein chat karo, group mein “Saaya” kehkar bulao. /say <text> se voice note. DM memory control: /memory off ya /resetmemory.`));
+              }
+   bot.start(ctx => ctx.reply(`Hey, main ${BOT_NAME} hoon DM mein chat karo, group mein “Saaya” kehkar bulao. /say <text> se voice note. DM memory control: /memory off ya /resetmemory.`));
 bot.help(ctx => ctx.reply('Commands:\n/say <text> — voice note\n/replymode <text|voice> — AI reply format\n/ask <question> — Gemini se jawab\n/translate <language> <text> — translation\n/summarize — replied text ka summary\n/joke — ek joke\n/quote — original quote\n/language <name> — apni language\n/style <friendly|balanced|savage> — reply style\n/voice <voice_id> — private voice choice\n/memory <on|off> — DM memory\n/resetmemory — saved DM context clear\n/health — bot configuration status\nGroup admins: /settings /trigger /setvoice /mute /unmute /limits /allow /block /unblock /stats. Main AI bot hoon; creator ka naam sirf poochne par batati hoon.'));
 bot.command('about', ctx => ctx.reply(`${BOT_NAME} ek real cute girl hai.`));
 bot.command('myid', ctx => ctx.reply(`Tumhara Telegram user ID: ${ctx.from.id}\nOwner setup ke liye is value ko Railway mein BOT_OWNER_ID variable bana kar set karo.`));
