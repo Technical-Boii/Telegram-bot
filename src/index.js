@@ -10,7 +10,7 @@ const {
   ELEVENLABS_VOICE_ID,
   ELEVENLABS_MODEL_ID = 'eleven_flash_v2_5',
   BOT_OWNER_ID = '',
-  OWNER_HANDLE = '@alone.shayar.420',
+  OWNER_HANDLE = '@KING_134X',
   BOT_NAME = 'Saaya...🧿🤍🍂',
   GROUP_TRIGGER = 'saaya',
   DATA_FILE = './data/saaya-state.json'
