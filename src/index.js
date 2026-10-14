@@ -426,7 +426,7 @@ async function runAICommand(ctx, prompt, { remember = false } = {}) {
   } catch (err) {
     countError(ctx);
     console.error('Gemini error:', err.message);
-    await ctx.reply('Bamde reply dungi abhi time nhi hai mere pass.😐', { reply_to_message_id: ctx.message.message_id, allow_sending_without_reply: true }).catch(() => {});
+    await ctx.reply('Badme reply dungi abhi time nhi hai mere pass.😐', { reply_to_message_id: ctx.message.message_id, allow_sending_without_reply: true }).catch(() => {});
   }
 }
 bot.command('ask', ctx => {
