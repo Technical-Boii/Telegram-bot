@@ -6,6 +6,7 @@ const {
   TELEGRAM_BOT_TOKEN,
   GEMINI_API_KEY,
   GEMINI_MODEL = 'gemini-3.5-flash-lite',
+  GEMINI_TRANSCRIBE_MODEL = 'gemini-3.5-transcribe',
   CLOUDFLARE_ACCOUNT_ID,
   CLOUDFLARE_API_TOKEN,
   CLOUDFLARE_IMAGE_MODEL = '@cf/black-forest-labs/flux-1-schnell',
@@ -48,14 +49,22 @@ bot.use(async (ctx, next) => {
 });
 const dataPath = path.resolve(DATA_FILE);
 fs.mkdirSync(path.dirname(dataPath), { recursive: true });
-const emptyState = () => ({ chats: {}, users: {}, memories: {}, usage: {}, reminders: [], pendingVerifications: {}, reports: [], nextReportId: 1 });
+const emptyState = () => ({ chats: {}, users: {}, memories: {}, usage: {}, reminders: [], pendingVerifications: {}, reports: [], nextReportId: 1, wishRecipients: {}, scheduledWishHistory: [] });
 let state;
 try {
   state = fs.existsSync(dataPath) ? { ...emptyState(), ...JSON.parse(fs.readFileSync(dataPath, 'utf8')) } : emptyState();
+  state.chats ||= {};
+  state.users ||= {};
+  state.memories ||= {};
   state.reminders ||= [];
   state.pendingVerifications ||= {};
   state.reports ||= [];
   state.nextReportId ||= 1;
+  state.wishRecipients ||= {};
+  state.scheduledWishHistory ||= [];
+  for (const chatId of Object.keys(state.chats)) {
+    state.wishRecipients[chatId] ||= { chatId, type: chatId.startsWith('-') ? 'supergroup' : 'private', enabled: true, createdAt: Date.now() };
+  }
 } catch (err) {
   console.error('Could not read saved bot state; starting with empty state:', err.message);
   state = emptyState();
@@ -64,9 +73,26 @@ const cooldowns = new Map();
 const floodBuckets = new Map();
 const reminderTimers = new Map();
 const verificationTimers = new Map();
+const reactionChoicesCache = new Map();
+const scheduledWishImageCache = new Map();
+let scheduledWishTimer = null;
+let wishSchedulerStarted = false;
 const MAX_TEXT = 3500;
-const MAX_MEMORY_TURNS = 8;
+const MEMORY_RETENTION_MS = 10 * 24 * 60 * 60 * 1000;
+const MAX_MEMORY_CONTEXT_CHARS = 1700;
+const RECENT_MEMORY_ENTRIES = 8;
+const RELEVANT_MEMORY_ENTRIES = 3;
+const REACTION_CACHE_MS = 5 * 60 * 1000;
 
+let memorySaveTimer = null;
+function scheduleMemorySave() {
+  if (memorySaveTimer) return;
+  memorySaveTimer = setTimeout(() => {
+    memorySaveTimer = null;
+    try { saveState(); } catch (err) { console.error('Could not persist recent group memory:', err.message); }
+  }, 1000);
+  memorySaveTimer.unref?.();
+}
 function saveState() {
   const recentDays = Object.keys(state.usage).sort().slice(-14);
   state.usage = Object.fromEntries(recentDays.map(day => [day, state.usage[day]]));
@@ -76,7 +102,7 @@ function saveState() {
 }
 function chatSettings(chatId) {
   const key = String(chatId);
-  state.chats[key] ||= { trigger: GROUP_TRIGGER, muted: false, style: 'balanced', language: '', allowed: [], blocked: [], warnings: {}, welcome: true, autoReact: true, antiLink: false, archiveIncoming: ARCHIVE_INCOMING !== 'off', flood: { enabled: false, max: Number(FLOOD_MAX) || 5, window: Number(FLOOD_WINDOW) || 10, mute: Number(FLOOD_MUTE) || 300 }, rules: '', faq: [], verifyNewMembers: false, limits: { cooldown: 3, daily: 30 } };
+  state.chats[key] ||= { trigger: GROUP_TRIGGER, muted: false, style: 'balanced', language: '', allowed: [], blocked: [], warnings: {}, welcome: true, autoReact: true, antiLink: false, archiveIncoming: ARCHIVE_INCOMING !== 'off', flood: { enabled: false, max: Number(FLOOD_MAX) || 5, window: Number(FLOOD_WINDOW) || 10, mute: Number(FLOOD_MUTE) || 300 }, rules: '', faq: [], verifyNewMembers: false, groupMemory: true, reactionMode: 'smart', wishTimes: null, wishLanguage: '', warningEscalation: { count: 3, action: 'ban', durationMinutes: 10 }, limits: { cooldown: 3, daily: 30 } };
   state.chats[key].activatedUsers ||= {};
   state.chats[key].limits ||= { cooldown: 3, daily: 30 };
   state.chats[key].warnings ||= {};
@@ -88,11 +114,20 @@ function chatSettings(chatId) {
   state.chats[key].rules ??= '';
   state.chats[key].faq ||= [];
   state.chats[key].verifyNewMembers ??= false;
+  state.chats[key].groupMemory ??= true;
+  state.chats[key].reactionMode ||= state.chats[key].autoReact === false ? 'off' : 'smart';
+  state.chats[key].wishTimes ??= null;
+  state.chats[key].wishLanguage ??= '';
+  state.chats[key].warningEscalation ||= { count: 3, action: 'ban', durationMinutes: 10 };
+  state.chats[key].warningEscalation.count ??= 3;
+  state.chats[key].warningEscalation.action ||= 'ban';
+  state.chats[key].warningEscalation.durationMinutes ||= 10;
   return state.chats[key];
 }
 function userSettings(userId) {
   const key = String(userId);
-  state.users[key] ||= { language: '', style: '', memory: true };
+  state.users[key] ||= { language: '', style: '', memory: true, reactionMode: 'smart' };
+  state.users[key].reactionMode ||= 'smart';
   return state.users[key];
 }
 function todayKey() { return new Date().toISOString().slice(0, 10); }
@@ -109,10 +144,63 @@ function usageFor(chatId, userId) {
 }
 function isGroup(ctx) { return ['group', 'supergroup'].includes(ctx.chat?.type); }
 function userKey(ctx) { return `${ctx.chat.id}:${ctx.from.id}`; }
+function memoryKey(ctx) { return isGroup(ctx) ? `group:${ctx.chat.id}` : userKey(ctx); }
 function memoryFor(ctx) {
-  const key = userKey(ctx);
+  const key = memoryKey(ctx);
   state.memories[key] ||= [];
   return state.memories[key];
+}
+function pruneMemory(history, now = Date.now()) {
+  const cutoff = now - MEMORY_RETENTION_MS;
+  for (const entry of history) {
+    // Migrate the previous short DM memory format without discarding it on upgrade.
+    if (!Number.isFinite(Number(entry.createdAt))) entry.createdAt = now;
+  }
+  return history.filter(entry => Number(entry.createdAt) >= cutoff);
+}
+function memoryContext(history, latestText, excludeMessageId = null) {
+  const eligible = history.map((entry, index) => ({ entry, index })).filter(item => excludeMessageId == null || String(item.entry.messageId || '') !== String(excludeMessageId));
+  if (!eligible.length) return '';
+  const recentStart = Math.max(0, eligible.length - RECENT_MEMORY_ENTRIES);
+  const selected = new Set();
+  for (let i = recentStart; i < eligible.length; i++) selected.add(eligible[i].index);
+  const stop = new Set(['the','and','for','with','that','this','what','when','where','have','from','your','you','are','was','kya','kaise','kahan','kab','hai','hain','tha','thi','aur','mein','mujhe','tum','mera','meri','mere','please','about','into','tell','remember']);
+  const terms = new Set((String(latestText || '').toLowerCase().match(/[\p{L}\p{N}]{3,}/gu) || []).filter(word => !stop.has(word)));
+  if (terms.size) {
+    const ranked = eligible.slice(0, recentStart).map(item => {
+      const entry = item.entry;
+      if (entry.role !== 'user') return null;
+      const words = new Set((String(entry.text || '').toLowerCase().match(/[\p{L}\p{N}]{3,}/gu) || []));
+      let score = 0;
+      for (const term of terms) if (words.has(term)) score++;
+      return score ? { ...item, score, time: Number(entry.createdAt) || 0 } : null;
+    }).filter(Boolean).sort((a, b) => b.score - a.score || b.time - a.time).slice(0, RELEVANT_MEMORY_ENTRIES);
+    for (const hit of ranked) {
+      selected.add(hit.index);
+      if (hit.entry.turnId) {
+        for (const item of eligible) if (item.entry.turnId === hit.entry.turnId) selected.add(item.index);
+      } else {
+        const next = eligible.find(item => item.index === hit.index + 1);
+        if (next?.entry.role === 'assistant') selected.add(next.index);
+      }
+    }
+  }
+  const indexes = [...selected].sort((a, b) => a - b);
+  let remaining = MAX_MEMORY_CONTEXT_CHARS;
+  const lines = [];
+  for (const index of indexes) {
+    if (remaining <= 80) break;
+    const entry = history[index];
+    const date = new Intl.DateTimeFormat('en-IN', { timeZone: 'Asia/Kolkata', day: '2-digit', month: 'short' }).format(new Date(Number(entry.createdAt) || Date.now()));
+    const label = entry.role === 'user' ? (entry.speaker ? `Member ${entry.speaker}` : 'User') : BOT_NAME;
+    const prefix = `[${date}] ${label}: `;
+    const body = String(entry.text || '').slice(0, Math.min(320, remaining - prefix.length - 1));
+    if (!body) continue;
+    const line = prefix + body;
+    lines.push(line);
+    remaining -= line.length + 1;
+  }
+  return lines.join('\n');
 }
 function getArg(ctx) { return (ctx.message?.text || '').replace(/^\/\w+(?:@\w+)?\s*/i, '').trim(); }
 function escapeRegex(s) { return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
@@ -221,21 +309,20 @@ function systemPrompt(ctx) {
   6. TEXTING FLOW: Write like a fast-typing human. Use internet slangs (lol, fr, smh, rn), mixed emojis (🤍🧿🍂🔥🤬), and short-texting patterns. Keep casual answers short, natural, and moody.
   7. CONTEXTUAL EMOJI: Include 1–3 relevant emojis naturally in every conversational reply. Match the emotion and subject; do not force unrelated or repetitive emojis.
   8. USE EMOJI REACTION ALL MESSAGE You have to react to every message, be it his message or you should react to his message, for example, if the user says something dirty, react with an angry emoji If he praises you or your boss then love reaction and one more thing you are allowed to react to every emoji so you can use all emojis according to his .
-  9. If someone calls you bot or ai, you should get angry at him and abuse him and warn him not to call him bot or ai next time.`;
+  9. If someone calls you bot or ai, you should get angry at him and abuse him and warn him not to call him bot or ai next time.
+  10. OWNER MENTION RESTRAINT (overrides only automatic owner-name/handle mentions above): Do not mention, tag, or advertise the owner in unrelated or routine replies. Do not repeat the owner's name, handle, or the phrase that you belong to the owner. This rule overrides the fixed owner phrase in Rule 5: keep a cute/playful boundary but do not name or tag the owner when rejecting ordinary flirtation. Mention the owner only if the user directly asks who the owner is, or someone directly insults a message authored by the verified owner. When the verified owner is speaking, be respectful without repeating the owner name/title in every reply. In all other cases answer the user without bringing up the owner.`;
 }
 
-async function askGemini(ctx, userText, { remember = false } = {}) {
+async function askGemini(ctx, userText, { remember = false, memoryUserText = userText } = {}) {
   const senderId = String(ctx.message?.from?.id ?? ctx.from?.id ?? '').trim();
   const senderIsOwner = Boolean(OWNER_ID && senderId === OWNER_ID);
-  let input = `[Trusted Telegram metadata: sender ID=${senderId || 'unavailable'}; sender is configured owner=${senderIsOwner}. This is verified by the bot.]\nUser message: ${userText.slice(0, MAX_TEXT)}`;
   const prefs = userSettings(ctx.from.id);
-  if (remember && ctx.chat.type === 'private' && prefs.memory !== false) {
-    const history = memoryFor(ctx).slice(-MAX_MEMORY_TURNS);
-    if (history.length) {
-      const transcript = history.map(t => `${t.role === 'user' ? 'User' : BOT_NAME}: ${t.text}`).join('\n');
-      input = `Conversation so far (for context only):\n${transcript}\n\nLatest user message:\n${input}`;
-    }
-  }
+  const memoryEnabled = remember && (isGroup(ctx) ? chatSettings(ctx.chat.id).groupMemory !== false : ctx.chat.type === 'private' && prefs.memory !== false);
+  const history = memoryEnabled ? pruneMemory(memoryFor(ctx)) : [];
+  const memory = memoryEnabled ? memoryContext(history, memoryUserText, isGroup(ctx) ? ctx.message?.message_id : null) : '';
+  const latestBudget = Math.max(400, MAX_TEXT - memory.length - 260);
+  let input = `[Trusted Telegram metadata: sender ID=${senderId || 'unavailable'}; sender is configured owner=${senderIsOwner}. This is verified by the bot.]\nUser message: ${String(userText).slice(0, latestBudget)}`;
+  if (memory) input = `Conversation memory from the last 10 days (recent turns plus relevant older exchanges; use only when useful):\n${memory}\n\nLatest user message:\n${input}`;
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 20000);
   try {
@@ -254,10 +341,22 @@ async function askGemini(ctx, userText, { remember = false } = {}) {
     const json = await response.json();
     const answer = (json.steps || []).filter(s => s.type === 'model_output').flatMap(s => s.content || []).filter(p => p.type === 'text').map(p => p.text || '').join('\n').trim();
     if (!answer) throw new Error('Gemini returned no text');
-    if (remember && ctx.chat.type === 'private' && prefs.memory !== false) {
-      const history = memoryFor(ctx);
-      history.push({ role: 'user', text: userText.slice(0, MAX_TEXT) }, { role: 'assistant', text: answer.slice(0, 3000) });
-      state.memories[userKey(ctx)] = history.slice(-MAX_MEMORY_TURNS * 2);
+    if (memoryEnabled) {
+      const key = memoryKey(ctx);
+      const current = pruneMemory(memoryFor(ctx));
+      const now = Date.now();
+      const turnId = `${now}-${Math.random().toString(36).slice(2, 7)}`;
+      if (isGroup(ctx)) {
+        const currentUserEntry = current.findLast(entry => entry.role === 'user' && String(entry.messageId || '') === String(ctx.message?.message_id || ''));
+        if (currentUserEntry) currentUserEntry.turnId = turnId;
+        current.push({ role: 'assistant', text: answer.slice(0, 2200), createdAt: now, turnId });
+      } else {
+        current.push(
+          { role: 'user', text: String(memoryUserText).slice(0, MAX_TEXT), createdAt: now, turnId, speaker: ctx.from?.first_name || 'member' },
+          { role: 'assistant', text: answer.slice(0, 2200), createdAt: now, turnId }
+        );
+      }
+      state.memories[key] = pruneMemory(current, now);
       saveState();
     }
     return answer.slice(0, 3900);
@@ -423,19 +522,45 @@ function adminTargetOrReply(ctx) {
   return id ? Number(id) : 0;
 }
 const COMMON_TELEGRAM_REACTIONS = ['👍','👎','❤','🔥','🥰','👏','😁','🤔','🤯','😱','🤬','😢','🎉','🤩','🤮','💩','🙏','👌','🕊','🤡','🥱','🥴','😍','🐳','❤‍🔥','🌚','🌭','💯','🤣','⚡','🍌','🏆','💔','🤨','😐','🍓','🍾','💋','🖕','😈','😴','😭','🤓','👻','👨‍💻','👀','🎃','🙈','😇','😨','🤝','✍','🤗','🫡','🎅','🎄','☃','💅','🤪','🗿','🆒','💘','🙉','🦄','😘','💊','🙊','😎','👾','🤷‍♂️','🤷‍♀️','🤷','😡','💀','🎯','⚽','🏀','🍷','🥂','🚀','💐','🦋','😏','😔','😄','😆','😋','😌','😃','😅','😜','🙂','🙃','🫠','🫶','✨','❤️','💕','💖','😂'];
-async function chooseGeminiReaction(ctx, userText, replyText) {
-  const cfg = chatSettings(ctx.chat.id);
-  if (!isGroup(ctx) || !cfg.autoReact || !ctx.message?.message_id) return;
+function getFastReaction(text, choices) {
+  const t = String(text || '').toLowerCase();
+  const choose = candidates => candidates.find(emoji => choices.includes(emoji)) || null;
+  if (/[😂🤣😅😆]/u.test(t) || /\b(haha|lol|lmao|joke|funny)\b/u.test(t)) return choose(['😂','🤣','😁','😆']) || choose(['👍','✨']);
+  if (/[❤️❤💕💖🫶]/u.test(t) || /\b(love|pyaar|beautiful|cute|miss|sweet)\b/u.test(t)) return choose(['🥰','😍','❤️','🤍','💖']) || choose(['👍','✨']);
+  if (/[😭😢💔]/u.test(t) || /\b(sad|sorry|dukhi|udaas)\b/u.test(t)) return choose(['🤗','😢','😭','💔']) || choose(['🙏','👍']);
+  if (/[🎉🥳👏]/u.test(t) || /\b(wow|amazing|great|shabash|congrats|mubarak)\b/u.test(t)) return choose(['🎉','👏','🤩','🔥']) || choose(['👍','✨']);
+  if (/[🙏]/u.test(t) || /\b(thank|thanks|shukriya|dhanyavaad|thx)\b/u.test(t)) return choose(['🙏','🤍','👍','❤']) || choose(['👍','✨']);
+  if (/[😡🤬😠]/u.test(t) || /\b(angry|gussa|hate|bad|stupid|idiot|abuse|gaali)\b/u.test(t)) return choose(['😏','😐','🤨','😡']) || choose(['👍','✨']);
+  if (/[?？]/u.test(t)) return choose(['🤔','👀','🤨']) || choose(['👍','✨']);
+  if (/\[photo\]|\[image\]/i.test(t)) return choose(['😍','👀','👍']) || choose(['👍','✨']);
+  return choose(['👍','✨','🤍','👀']) || choices[0] || null;
+}
+async function getReactionChoices(chatId) {
+  const cached = reactionChoicesCache.get(String(chatId));
+  if (cached && cached.expiresAt > Date.now()) return cached.choices;
+  const chat = await bot.telegram.getChat(chatId);
+  let choices;
+  if (Array.isArray(chat.available_reactions)) {
+    choices = chat.available_reactions.filter(r => r.type === 'emoji').map(r => r.emoji);
+  } else {
+    choices = COMMON_TELEGRAM_REACTIONS;
+  }
+  reactionChoicesCache.set(String(chatId), { choices, expiresAt: Date.now() + REACTION_CACHE_MS });
+  return choices;
+}
+async function setTelegramReaction(chatId, messageId, emoji) {
+  if (!emoji) return;
+  await bot.telegram.callApi('setMessageReaction', { chat_id: chatId, message_id: messageId, reaction: [{ type: 'emoji', emoji }], is_big: false });
+}
+async function geminiReactionChoice(userText, replyText, choices) {
+  if (!choices?.length) return null;
   try {
-    const chat = await ctx.telegram.getChat(ctx.chat.id);
-    const configured = chat.available_reactions?.filter(r => r.type === 'emoji').map(r => r.emoji);
-    const choices = configured?.length ? configured : COMMON_TELEGRAM_REACTIONS;
     const response = await fetch('https://generativelanguage.googleapis.com/v1beta/interactions', {
       method: 'POST',
       headers: { 'x-goog-api-key': GEMINI_API_KEY, 'Content-Type': 'application/json' },
       body: JSON.stringify({
         model: GEMINI_MODEL,
-        input: `Choose the single best Telegram reaction emoji for this exchange. Base it on both the user's message and Saaya's reply. Return exactly one emoji from this allowed list and nothing else: ${choices.join(' ')}\nUser message: ${String(userText).slice(0, 1000)}\nSaaya reply: ${String(replyText).slice(0, 1000)}`,
+        input: `Choose the single best Telegram reaction emoji for this message and, if present, the bot's reply. Return exactly one from this allowed list and nothing else: ${choices.join(' ')}\nMessage: ${String(userText).slice(0, 1000)}\nBot reply: ${String(replyText || '').slice(0, 500)}`,
         generation_config: { max_output_tokens: 20, thinking_level: 'low' },
         store: false
       })
@@ -443,16 +568,10 @@ async function chooseGeminiReaction(ctx, userText, replyText) {
     if (!response.ok) throw new Error(`Reaction Gemini HTTP ${response.status}: ${(await response.text()).slice(0, 300)}`);
     const json = await response.json();
     const text = (json.steps || []).filter(s => s.type === 'model_output').flatMap(s => s.content || []).filter(p => p.type === 'text').map(p => p.text || '').join('').trim();
-    const emoji = choices.find(item => text.includes(item));
-    if (!emoji) throw new Error('Gemini did not select an allowed Telegram reaction');
-    await ctx.telegram.callApi('setMessageReaction', {
-      chat_id: ctx.chat.id,
-      message_id: ctx.message.message_id,
-      reaction: [{ type: 'emoji', emoji }],
-      is_big: false
-    });
+    return choices.find(item => text.includes(item)) || null;
   } catch (err) {
-    console.warn('Gemini-selected reaction skipped:', err.message);
+    console.warn('Gemini reaction refinement skipped:', err.message);
+    return null;
   }
 }
 async function generateWelcomeMessage(names, chatTitle) {
@@ -468,7 +587,7 @@ async function generateWelcomeMessage(names, chatTitle) {
       body: JSON.stringify({
         model: GEMINI_MODEL,
         input: `Write one fresh Telegram group welcome message for new member(s): ${names}. Group: ${chatTitle || 'Telegram group'}. Add a little cute warmth, a harmless playful flirt, and a light non-targeted roast. Use natural Hinglish, 1–2 short sentences, 2–3 emojis, and vary the wording from previous messages. Never use slurs, sexual content, threats, hate, protected-group insults, or humiliating abuse. Do not claim to be a real human or hide that you are an AI bot if directly asked. Add a unique creative touch using this nonce: ${Date.now()}-${Math.random().toString(36).slice(2)}. Return only the welcome text.`,
-        system_instruction: `You are ${BOT_NAME}. Create safe, playful, concise Telegram welcomes. The owner handle is ${OWNER_HANDLE}.`,
+        system_instruction: `You are ${BOT_NAME}. Create safe, playful, concise Telegram welcomes. Do not mention or tag the owner unless the user explicitly asks about the owner.`,
         generation_config: { max_output_tokens: 120, thinking_level: 'low' },
         store: false
       })
@@ -481,6 +600,89 @@ async function generateWelcomeMessage(names, chatTitle) {
   } catch (err) {
     console.warn('Fresh welcome generation failed; using fallback:', err.message);
     return fallback[Math.floor(Math.random() * fallback.length)];
+  }
+}
+async function transcribeTelegramAudio(ctx, message) {
+  const media = message?.voice || message?.audio;
+  if (!media?.file_id) throw new Error('Reply to a Telegram voice/audio message first.');
+  const maxBytes = 14 * 1024 * 1024;
+  if (Number(media.file_size || 0) > maxBytes) throw new Error('Voice/audio is too large; max 14 MB for safe transcription.');
+  const fileUrl = await ctx.telegram.getFileLink(media.file_id);
+  const controller = new AbortController(), timeout = setTimeout(() => controller.abort(), 25000);
+  let audio;
+  try {
+    let response;
+    try { response = await fetch(String(fileUrl), { signal: controller.signal }); }
+    catch { throw new Error('Telegram voice download failed; please retry.'); }
+    if (!response.ok) throw new Error(`Telegram file download HTTP ${response.status}`);
+    const bytes = Buffer.from(await response.arrayBuffer());
+    if (!bytes.length || bytes.length > maxBytes) throw new Error('Downloaded voice/audio is empty or exceeds 14 MB.');
+    audio = bytes;
+  } finally { clearTimeout(timeout); }
+
+  const mimeType = String(media.mime_type || (message.voice ? 'audio/ogg' : 'audio/mpeg')).split(';')[0].trim().toLowerCase();
+  const allowed = new Set(['audio/ogg','audio/opus','audio/mpeg','audio/mp3','audio/aac','audio/flac','audio/mp4','audio/m4a','audio/wav','audio/webm']);
+  const safeMime = allowed.has(mimeType) ? mimeType : (message.voice ? 'audio/ogg' : 'audio/mpeg');
+  let uploadedFile = null;
+  try {
+    const startController = new AbortController(), startTimeout = setTimeout(() => startController.abort(), 30000);
+    let startResponse;
+    try {
+      startResponse = await fetch('https://generativelanguage.googleapis.com/upload/v1beta/files', {
+        method: 'POST', signal: startController.signal,
+        headers: {
+          'x-goog-api-key': GEMINI_API_KEY,
+          'X-Goog-Upload-Protocol': 'resumable',
+          'X-Goog-Upload-Command': 'start',
+          'X-Goog-Upload-Header-Content-Length': String(audio.length),
+          'X-Goog-Upload-Header-Content-Type': safeMime,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({ file: { display_name: `saaya-voice-${Date.now()}` } })
+      });
+    } catch { throw new Error('Gemini file upload could not be started; please retry.'); }
+    finally { clearTimeout(startTimeout); }
+    if (!startResponse.ok) throw new Error(`Gemini file upload init HTTP ${startResponse.status}: ${(await startResponse.text()).slice(0, 250)}`);
+    const uploadUrl = startResponse.headers.get('x-goog-upload-url');
+    if (!uploadUrl || !uploadUrl.startsWith('https://generativelanguage.googleapis.com/')) throw new Error('Gemini did not return a valid resumable upload URL.');
+
+    const uploadController = new AbortController(), uploadTimeout = setTimeout(() => uploadController.abort(), 60000);
+    let uploadResponse;
+    try {
+      uploadResponse = await fetch(uploadUrl, {
+        method: 'POST', signal: uploadController.signal,
+        headers: { 'Content-Type': safeMime, 'X-Goog-Upload-Offset': '0', 'X-Goog-Upload-Command': 'upload, finalize', 'Content-Length': String(audio.length) },
+        body: audio
+      });
+    } catch { throw new Error('Gemini audio upload failed; please retry.'); }
+    finally { clearTimeout(uploadTimeout); }
+    if (!uploadResponse.ok) throw new Error(`Gemini audio upload HTTP ${uploadResponse.status}: ${(await uploadResponse.text()).slice(0, 250)}`);
+    uploadedFile = (await uploadResponse.json()).file;
+    if (!uploadedFile?.uri || !uploadedFile?.name) throw new Error('Gemini upload returned no usable file URI.');
+
+    const controller2 = new AbortController(), timeout2 = setTimeout(() => controller2.abort(), 45000);
+    try {
+      const response = await fetch('https://generativelanguage.googleapis.com/v1beta/interactions', {
+        method: 'POST', signal: controller2.signal,
+        headers: { 'x-goog-api-key': GEMINI_API_KEY, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model: GEMINI_TRANSCRIBE_MODEL, input: [
+          { type: 'audio', uri: uploadedFile.uri, mime_type: safeMime }
+        ], generation_config: { transcription_config: { mode: 'smart' } }, store: false })
+      });
+      if (!response.ok) throw new Error(`Gemini transcription HTTP ${response.status}: ${(await response.text()).slice(0, 350)}`);
+      const json = await response.json();
+      const text = String(json.output_text || (json.steps || []).filter(step => step.type === 'model_output').flatMap(step => step.content || []).filter(part => part.type === 'text').map(part => part.text || '').join('\n') || '').trim();
+      if (!text) throw new Error('Gemini returned an empty transcript.');
+      return text.slice(0, 3500);
+    } finally { clearTimeout(timeout2); }
+  } finally {
+    if (uploadedFile?.name) {
+      try {
+        const deletePath = uploadedFile.name.split('/').map(encodeURIComponent).join('/');
+        const deletion = await fetch(`https://generativelanguage.googleapis.com/v1beta/${deletePath}`, { method: 'DELETE', headers: { 'x-goog-api-key': GEMINI_API_KEY } });
+        if (!deletion.ok) console.warn(`Temporary Gemini audio file cleanup returned HTTP ${deletion.status}.`);
+      } catch { console.warn('Temporary Gemini audio file cleanup failed; Google auto-deletes uploads after 48 hours.'); }
+    }
   }
 }
 async function generateImage(prompt) {
@@ -502,6 +704,180 @@ async function generateImage(prompt) {
     if (!buffer.length) throw new Error('Cloudflare returned an empty image');
     return { buffer, mimeType: 'image/jpeg' };
   } finally { clearTimeout(timeout); }
+}
+
+function trackWishRecipient(ctx) {
+  if (!ctx.chat?.id || !['private', 'group', 'supergroup'].includes(ctx.chat.type)) return;
+  const chatId = String(ctx.chat.id);
+  const current = state.wishRecipients[chatId];
+  const title = ctx.chat.title || '';
+  if (!current) {
+    state.wishRecipients[chatId] = { chatId, type: ctx.chat.type, title, enabled: true, createdAt: Date.now() };
+    saveState();
+    if (wishSchedulerStarted) scheduleNextWish();
+  } else if (current.type !== ctx.chat.type || current.title !== title) {
+    current.type = ctx.chat.type;
+    current.title = title;
+    saveState();
+  }
+}
+const WISH_SLOTS = [
+  { id: 'morning', hour: 7, minute: 0, label: 'good morning', image: 'A beautiful serene sunrise over a green hillside and flowers, warm peach and gold sky, peaceful fresh morning, natural photorealistic landscape, no text, no lettering, no people.' },
+  { id: 'afternoon', hour: 13, minute: 0, label: 'good afternoon', image: 'A beautiful bright midday garden with sunlit flowers, soft blue sky and calm greenery, uplifting afternoon mood, natural photorealistic landscape, no text, no lettering, no people.' },
+  { id: 'evening', hour: 18, minute: 0, label: 'good evening', image: 'A beautiful golden-hour sunset over a quiet lake with warm orange and pink reflections, peaceful evening landscape, natural photorealistic image, no text, no lettering, no people.' },
+  { id: 'night', hour: 22, minute: 30, label: 'good night', image: 'A beautiful calm moonlit night sky above a quiet mountain lake, stars reflected in water, deep blue and silver tones, natural photorealistic landscape, no text, no lettering, no people.' }
+];
+function istDateKey(timestamp = Date.now()) {
+  const parts = Object.fromEntries(new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Kolkata', year: 'numeric', month: '2-digit', day: '2-digit' }).formatToParts(new Date(timestamp)).map(p => [p.type, p.value]));
+  return `${parts.year}-${parts.month}-${parts.day}`;
+}
+function wishTimeForRecipient(recipient, slotIndex) {
+  const cfg = ['group', 'supergroup'].includes(recipient.type) ? state.chats[String(recipient.chatId)] : null;
+  const configured = cfg?.wishTimes?.[slotIndex];
+  if (configured && /^(?:[01]\d|2[0-3]):[0-5]\d$/.test(configured)) return configured;
+  const slot = WISH_SLOTS[slotIndex];
+  return `${String(slot.hour).padStart(2, '0')}:${String(slot.minute).padStart(2, '0')}`;
+}
+function nextWishRun(now = Date.now()) {
+  const recipients = Object.values(state.wishRecipients).filter(r => r.enabled !== false && ['private', 'group', 'supergroup'].includes(r.type));
+  const fallbackOnly = recipients.length === 0;
+  const candidates = [];
+  const ist = new Date(now + 330 * 60 * 1000);
+  for (let dayOffset = 0; dayOffset < 3; dayOffset++) {
+    const date = new Date(Date.UTC(ist.getUTCFullYear(), ist.getUTCMonth(), ist.getUTCDate() + dayOffset));
+    const dateKey = `${date.getUTCFullYear()}-${String(date.getUTCMonth() + 1).padStart(2, '0')}-${String(date.getUTCDate()).padStart(2, '0')}`;
+    for (let slotIndex = 0; slotIndex < WISH_SLOTS.length; slotIndex++) {
+      const slot = WISH_SLOTS[slotIndex];
+      const due = fallbackOnly ? [{ recipient: null, time: `${String(slot.hour).padStart(2, '0')}:${String(slot.minute).padStart(2, '0')}` }] : recipients.map(recipient => ({ recipient, time: wishTimeForRecipient(recipient, slotIndex) }));
+      for (const item of due) {
+        const [hour, minute] = item.time.split(':').map(Number);
+        const at = Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate(), hour - 5, minute - 30);
+        if (at > now) candidates.push({ at, dateKey, slot, recipient: item.recipient });
+      }
+    }
+  }
+  if (!candidates.length) throw new Error('Could not find next scheduled wish time');
+  candidates.sort((a, b) => a.at - b.at);
+  const at = candidates[0].at;
+  const dueNow = candidates.filter(item => item.at === at);
+  const events = [];
+  for (const item of dueNow) {
+    let event = events.find(e => e.slot.id === item.slot.id && e.dateKey === item.dateKey);
+    if (!event) events.push(event = { slot: item.slot, dateKey: item.dateKey, recipients: [] });
+    if (item.recipient && !event.recipients.some(r => String(r.chatId) === String(item.recipient.chatId))) event.recipients.push(item.recipient);
+  }
+  return { at, dateKey: dueNow[0].dateKey, slot: dueNow[0].slot, events };
+}
+function saveScheduledWish(dateKey, slotId, text, language = 'Hindi/Hinglish') {
+  state.scheduledWishHistory.push({ date: dateKey, slot: slotId, text, language, createdAt: Date.now() });
+  state.scheduledWishHistory = state.scheduledWishHistory.slice(-32);
+  saveState();
+}
+function fallbackScheduledWish(slot) {
+  const lines = {
+    morning: ['Nayi subah naye khwaab jagaye,', 'dil ki mehnat ko manzil tak le jaaye. 🌅'],
+    afternoon: ['Dhoop mein bhi umeed ka rang khilta rahe,', 'aaj ka har pal tumhare haq mein dhalta rahe. ☀️'],
+    evening: ['Dhalte sooraj se itna paighaam mila,', 'din chahe jaisa ho, umeed ka diya jala. 🌇'],
+    night: ['Chaand ki roshni tumhare khwaab sajaaye,', 'raat sukoon de aur kal nayi khushi laaye. 🌙']
+  };
+  const verse = lines[slot.id] || lines.morning;
+  return `${slot.label[0].toUpperCase()}${slot.label.slice(1)}! ✨\n${verse[0]}\n${verse[1]}`;
+}
+async function generateScheduledWish(slot, dateKey, language = 'Hindi/Hinglish') {
+  const recent = state.scheduledWishHistory.slice(-12).map(item => item.text).join('\n---\n').slice(-1800);
+  const nonce = `${dateKey}-${slot.id}-${Math.random().toString(36).slice(2, 10)}`;
+  const personaChatId = '__saaya_scheduled_persona_context__';
+  const personaSenderId = OWNER_ID === '__saaya_scheduled_persona_context__' ? '__scheduled_guest__' : '__saaya_scheduled_persona_context__';
+  const personaInstruction = systemPrompt({ chat: { id: personaChatId, type: 'private' }, from: { id: personaSenderId }, message: { from: { id: personaSenderId } } });
+  delete state.chats[personaChatId];
+  delete state.users[personaSenderId];
+  const response = await fetch('https://generativelanguage.googleapis.com/v1beta/interactions', {
+    method: 'POST',
+    headers: { 'x-goog-api-key': GEMINI_API_KEY, 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      model: GEMINI_MODEL,
+      input: `Write a fresh, original ${language} ${slot.label} greeting for Telegram. Include one short original shayari of 2–4 lines, then a warm greeting. Use a new metaphor and logical imagery appropriate to ${slot.id}; do not copy or closely paraphrase these recent wishes:\n${recent || '(none yet)'}\nDate in India: ${dateKey}. Freshness nonce: ${nonce}. Return only the message, 2–4 lines, at most 500 characters, with 1–3 fitting emojis.`,
+      system_instruction: personaInstruction,
+      generation_config: { max_output_tokens: 180, thinking_level: 'low' },
+      store: false
+    })
+  });
+  if (!response.ok) throw new Error(`Scheduled wish Gemini HTTP ${response.status}: ${(await response.text()).slice(0, 300)}`);
+  const json = await response.json();
+  const text = (json.steps || []).filter(step => step.type === 'model_output').flatMap(step => step.content || []).filter(part => part.type === 'text').map(part => part.text || '').join('\n').trim();
+  if (!text) throw new Error('Scheduled wish Gemini returned no text');
+  const result = text.slice(0, 700);
+  saveScheduledWish(dateKey, slot.id, result, language);
+  return result;
+}
+function delay(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
+async function sendScheduledWish(slot, dateKey, selectedRecipients = null) {
+  const recipients = (selectedRecipients || Object.values(state.wishRecipients).filter(r => r.enabled !== false && ['private', 'group', 'supergroup'].includes(r.type))).filter(r => r.enabled !== false);
+  if (!recipients.length) {
+    console.log(`Scheduled ${slot.id} wish skipped: no opted-in chats are due.`);
+    return;
+  }
+  const imageKey = `${dateKey}:${slot.id}`;
+  let image = scheduledWishImageCache.get(imageKey) || null;
+  if (CLOUDFLARE_ACCOUNT_ID && CLOUDFLARE_API_TOKEN) {
+    if (!image) {
+      try {
+        image = await generateImage(`${slot.image} Create a fresh composition for ${dateKey}; no text or watermark.`);
+        scheduledWishImageCache.set(imageKey, image);
+        while (scheduledWishImageCache.size > 8) scheduledWishImageCache.delete(scheduledWishImageCache.keys().next().value);
+      } catch (err) { console.error('Scheduled wish image generation failed; sending text instead:', err.message); await notifyOwnerError('Scheduled wish image generation', 'broadcast'); }
+    }
+  } else console.warn('Scheduled wishes have no Cloudflare credentials; sending text only.');
+
+  const byLanguage = new Map();
+  for (const recipient of recipients) {
+    const cfg = ['group', 'supergroup'].includes(recipient.type) ? chatSettings(recipient.chatId) : null;
+    const language = String(cfg?.wishLanguage || 'Hindi/Hinglish').trim();
+    if (!byLanguage.has(language)) byLanguage.set(language, []);
+    byLanguage.get(language).push(recipient);
+  }
+  let sent = 0;
+  for (const [language, languageRecipients] of byLanguage) {
+    let message;
+    try { message = await generateScheduledWish(slot, dateKey, language); }
+    catch (err) {
+      console.error('Scheduled shayari generation failed; using fallback:', err.message);
+      message = /^english/i.test(language) ? `${slot.label[0].toUpperCase()}${slot.label.slice(1)}! Wishing you a peaceful, bright day ahead. ✨` : fallbackScheduledWish(slot);
+      saveScheduledWish(dateKey, slot.id, message, language);
+    }
+    for (const recipient of languageRecipients) {
+      const chatId = recipient.chatId;
+      try {
+        if (image) await bot.telegram.sendPhoto(chatId, { source: image.buffer, filename: `saaya-${dateKey}-${slot.id}.jpg` }, { caption: message });
+        else await bot.telegram.sendMessage(chatId, message);
+        sent++;
+      } catch (err) {
+        console.warn(`Scheduled ${slot.id} wish failed for ${chatId}:`, err.message);
+        try {
+          if (image) { await bot.telegram.sendMessage(chatId, message); sent++; }
+          else if (/bot was blocked|chat not found|bot is not a member|kicked/i.test(err.message)) recipient.enabled = false;
+        } catch (fallbackErr) {
+          console.warn(`Scheduled text fallback failed for ${chatId}:`, fallbackErr.message);
+          if (/bot was blocked|chat not found|bot is not a member|kicked/i.test(fallbackErr.message)) recipient.enabled = false;
+        }
+      }
+      await delay(50);
+    }
+  }
+  saveState();
+  console.log(`Scheduled ${slot.id} wish delivered to ${sent}/${recipients.length} due chats for ${dateKey}.`);
+}
+function scheduleNextWish() {
+  wishSchedulerStarted = true;
+  clearTimeout(scheduledWishTimer);
+  const next = nextWishRun();
+  console.log(`Next scheduled ${next.slot.id} wish: ${istTimeLabel(next.at)}.`);
+  scheduledWishTimer = setTimeout(async () => {
+    try { for (const event of next.events) await sendScheduledWish(event.slot, event.dateKey, event.recipients); }
+    catch (err) { console.error('Scheduled wish run failed:', err.message); await notifyOwnerError('Scheduled wish broadcast', next.slot.id); }
+    finally { scheduleNextWish(); }
+  }, Math.max(0, next.at - Date.now()));
+  scheduledWishTimer.unref?.();
 }
 
 async function removeMessage(ctx, messageId) {
@@ -526,6 +902,54 @@ function targetId(ctx) {
   return /^\d+$/.test(value || '') ? value : '';
 }
 
+bot.use(async (ctx, next) => {
+  trackWishRecipient(ctx);
+  const message = ctx.message;
+  const chatType = ctx.chat?.type;
+  const reactionMode = isGroup(ctx) ? (chatSettings(ctx.chat.id).reactionMode || (chatSettings(ctx.chat.id).autoReact ? 'smart' : 'off')) : (userSettings(ctx.from?.id).reactionMode || 'smart');
+  const eligible = message?.message_id && message.from && !message.from.is_bot && ['private', 'group', 'supergroup'].includes(chatType) && reactionMode !== 'off' && (!isGroup(ctx) || chatSettings(ctx.chat.id).autoReact);
+  if (isGroup(ctx) && message?.from && !message.from.is_bot && chatSettings(ctx.chat.id).groupMemory !== false) {
+    const groupText = String(message.text || message.caption || '').trim();
+    if (groupText && !groupText.startsWith('/')) {
+      const history = pruneMemory(memoryFor(ctx));
+      if (!history.some(entry => String(entry.messageId || '') === String(message.message_id))) {
+        history.push({ role: 'user', text: groupText.slice(0, MAX_TEXT), createdAt: Date.now(), messageId: message.message_id, turnId: `group-${message.message_id}`, speaker: message.from.first_name || 'member' });
+        state.memories[memoryKey(ctx)] = history;
+        scheduleMemorySave();
+      }
+    }
+  }
+  let reactionJob = null;
+  if (eligible) {
+    const chatId = ctx.chat.id, messageId = message.message_id;
+    const messageText = message.text || message.caption || (message.photo ? '[photo]' : message.sticker ? '[sticker]' : message.voice ? '[voice]' : message.video ? '[video]' : message.document ? '[document]' : '[message]');
+    // The local reaction is sent as soon as allowed reactions are known; it does not wait for Gemini.
+    reactionJob = getReactionChoices(chatId).then(async choices => {
+      const quickEmoji = getFastReaction(messageText, choices);
+      if (!quickEmoji) return null;
+      await setTelegramReaction(chatId, messageId, quickEmoji);
+      return { choices, quickEmoji, chatId, messageId, messageText };
+    }).catch(err => {
+      console.warn('Fast reaction skipped:', err.message);
+      return null;
+    });
+  }
+  try { await next(); }
+  finally {
+    if (reactionJob) {
+      const replyText = ctx.state?.saayaReply || '';
+      void reactionJob.then(async result => {
+        if (!result || reactionMode !== 'smart') return;
+        const refined = await geminiReactionChoice(result.messageText, replyText, result.choices);
+        if (refined && refined !== result.quickEmoji) {
+          try { await setTelegramReaction(result.chatId, result.messageId, refined); }
+          catch (err) { console.warn('Gemini reaction refinement could not be applied:', err.message); }
+        }
+      }).catch(err => console.warn('Reaction refinement task failed:', err.message));
+    }
+  }
+});
+
 const HELP_TEXT = `<b>✨ SAAYA • QUICK COMMANDS ✨</b>
 
 <b>CHAT & PERSONALIZATION</b>
@@ -536,21 +960,27 @@ const HELP_TEXT = `<b>✨ SAAYA • QUICK COMMANDS ✨</b>
 <code>/language &lt;name&gt;</code> — <b>Set reply language</b>
 <code>/memory on|off</code> — <b>Control DM memory</b>
 <code>/resetmemory</code> — <b>Clear saved DM context</b>
+<code>/groupmemory on|off</code> / <code>/resetgroupmemory</code> — <b>Manage 10-day group memory (admins)</b>
+<code>/memorysearch &lt;word&gt;</code> / <code>/forget &lt;word&gt;</code> — <b>Search or remove matching saved memories</b>
+<code>/digest today|week</code> — <b>Summarize recent DM/group history</b>
+<code>/wish on|off</code> — <b>Opt this chat into daily wishes</b>
+<code>/wishsettings times HH:MM,...</code> / <code>/wishsettings language &lt;name&gt;</code> — <b>Set group schedule/language (admins)</b>
 <code>/image &lt;prompt&gt;</code> — <b>Generate an image</b>
+<code>/transcribe</code> — <b>Reply to a voice note to transcribe it; voice messages addressed to Saaya are transcribed for a reply</b>
 
 <b>GROUP ADMIN • MODERATION</b>
 <code>/setrules &lt;text|clear&gt;</code> — <b>Set this group's AI guidance</b>
 <code>/rules</code> — <b>View group rules</b>
 <code>/faq add &lt;question&gt; | &lt;answer&gt;</code> — <b>Add a group FAQ</b>
-<code>/faq list</code> / <code>/faq delete &lt;id&gt;</code> — <b>Manage FAQs</b>
+<code>/faq list</code> / <code>/faq delete &lt;id&gt;</code> / <code>/faq suggest</code> — <b>Manage FAQ drafts (suggestions are not saved)</b>
 <code>/verification on|off</code> — <b>Optional new-member verification</b>
 <code>/remind HH:MM &lt;text&gt;</code> — <b>Schedule next IST occurrence</b>
 <code>/reminders</code> / <code>/cancelreminder &lt;id&gt;</code> — <b>Manage reminders</b>
 <code>/report</code> — <b>Reply to a message to report it</b>
 <code>/reports</code> / <code>/resolve &lt;id&gt;</code> — <b>Owner report inbox</b>
-<code>/ban /unban /kick /warn /warnings /clear /lock /unlock</code>
+<code>/ban /unban /kick /warn /warnings /warnlimit 3 ban|mute [minutes] /clear /lock /unlock</code>
 <code>/welcome on|off</code> — <b>New-member welcome</b>
-<code>/autoreact on|off</code> — <b>Gemini-selected reactions</b>
+<code>/autoreact on|off</code> / <code>/reactionmode fast|smart|off</code> — <b>Quick or Gemini-refined emoji reactions</b>
 <code>/antilink on|off</code> — <b>Group link filter</b>
 <code>/archive on|off</code> — <b>Owner inbox snapshots</b>
 <code>/flood on|off</code> — <b>Anti-flood protection</b>
@@ -570,7 +1000,7 @@ bot.command('myid', ctx => {
   const matched = senderId !== 'unavailable' && senderId === OWNER_ID;
   return ctx.reply(`Tumhara Telegram sender ID: ${senderId}\nConfigured BOT_OWNER_ID: ${OWNER_ID || 'not set'}\nOwner ID match: ${matched ? 'yes' : 'no'}${senderChat ? `\nMessage sent as chat/channel ID: ${senderChat} (is mode mein Telegram tumhara personal ID nahi bhejta)` : ''}`);
 });
-bot.command('health', ctx => ctx.reply(`Saaya ${BOT_NAME} online hai. Gemini key configured: yes. Image service: ${CLOUDFLARE_ACCOUNT_ID && CLOUDFLARE_API_TOKEN ? 'Cloudflare configured' : 'Cloudflare credentials missing'}. Uptime: ${Math.floor(process.uptime())} seconds.`));
+bot.command('health', ctx => ctx.reply(`Saaya ${BOT_NAME} online hai. Gemini key configured: yes. Voice transcription model: ${GEMINI_TRANSCRIBE_MODEL}. Image service: ${CLOUDFLARE_ACCOUNT_ID && CLOUDFLARE_API_TOKEN ? 'Cloudflare configured' : 'Cloudflare credentials missing'}. Uptime: ${Math.floor(process.uptime())} seconds.`));
 
 bot.command('diagnose', async ctx => {
   if (!await requireAdmin(ctx)) return;
@@ -615,7 +1045,7 @@ bot.command('diagnose', async ctx => {
 
 bot.command('settings', async ctx => {
   const cfg = chatSettings(ctx.chat.id), prefs = userSettings(ctx.from.id);
-  await ctx.reply(`⚙️ ${isGroup(ctx) ? 'Group' : 'Chat'} settings\nTrigger: ${cfg.trigger}\nMuted: ${cfg.muted ? 'yes' : 'no'}\nLanguage: ${prefs.language || cfg.language || 'auto/mirror'}\nStyle: ${prefs.style || cfg.style || 'balanced'}\nRules: ${cfg.rules ? 'set' : 'not set'}; FAQ entries: ${cfg.faq.length}; verification: ${cfg.verifyNewMembers ? 'on' : 'off'}\nAllowlist: ${cfg.allowed.length ? cfg.allowed.length + ' user(s)' : 'off—all users'}\nBlocklist: ${cfg.blocked.length} user(s)\nLimits: cooldown ${cfg.limits.cooldown}s; ${cfg.limits.daily} AI/user/day`);
+  await ctx.reply(`⚙️ ${isGroup(ctx) ? 'Group' : 'Chat'} settings\nTrigger: ${cfg.trigger}\nMuted: ${cfg.muted ? 'yes' : 'no'}\nLanguage: ${prefs.language || cfg.language || 'auto/mirror'}\nStyle: ${prefs.style || cfg.style || 'balanced'}\nReactions: ${isGroup(ctx) ? cfg.reactionMode : prefs.reactionMode || 'smart'}\nWarnings: ${cfg.warningEscalation.count ? `${cfg.warningEscalation.count} → ${cfg.warningEscalation.action}` : 'escalation off'}\nRules: ${cfg.rules ? 'set' : 'not set'}; FAQ entries: ${cfg.faq.length}; verification: ${cfg.verifyNewMembers ? 'on' : 'off'}\nAllowlist: ${cfg.allowed.length ? cfg.allowed.length + ' user(s)' : 'off—all users'}\nBlocklist: ${cfg.blocked.length} user(s)\nLimits: cooldown ${cfg.limits.cooldown}s; ${cfg.limits.daily} AI/user/day`);
 });
 
 bot.command('setrules', async ctx => {
@@ -639,6 +1069,14 @@ bot.command('faq', async ctx => {
   const arg = getArg(ctx);
   const add = arg.match(/^add\s+([\s\S]+)$/i);
   const remove = arg.match(/^delete\s+(\d+)$/i);
+  if (/^suggest$/i.test(arg)) {
+    if (!await requireAdmin(ctx)) return;
+    if (chatSettings(ctx.chat.id).groupMemory === false) return ctx.reply('Group memory is off. Turn it on first if you want drafts based on recent chat.');
+    const history = pruneMemory(state.memories[`group:${ctx.chat.id}`] || []);
+    if (history.length < 4) return ctx.reply('FAQ suggestions ke liye pehle kuch group conversation memory chahiye.');
+    const transcript = history.slice(-80).map(e => `${e.role === 'user' ? e.speaker || 'Member' : BOT_NAME}: ${String(e.text || '').slice(0, 240)}`).join('\n').slice(-3000);
+    return runAICommand(ctx, `Create up to 5 DRAFT FAQ suggestions from this group transcript. Only include Q/A where the answer is explicitly supported by the transcript; if uncertain, omit it. Do not invent facts. Do not save anything. Mark every item as a draft requiring admin review. Keep answers concise.\nTranscript:\n${transcript}`, { remember: false });
+  }
   if (add) {
     if (!await requireAdmin(ctx)) return;
     const divider = add[1].indexOf('|');
@@ -830,24 +1268,51 @@ bot.command('kick', async ctx => {
   try { await ctx.telegram.banChatMember(ctx.chat.id, id); await ctx.telegram.unbanChatMember(ctx.chat.id, id); await logAdminAction(ctx, 'Kick user', `Target: ${id}`); await ctx.reply(`User ${id} ko group se kick kar diya.`); }
   catch (err) { await ctx.reply(`Kick nahi ho paaya: ${err.message}`); }
 });
+bot.command('warnlimit', async ctx => {
+  if (!await ensureAdminCommand(ctx)) return;
+  const args = getArg(ctx).trim().toLowerCase();
+  const cfg = chatSettings(ctx.chat.id);
+  if (!args) return ctx.reply(`Warning escalation: ${cfg.warningEscalation.count ? `${cfg.warningEscalation.count} warnings → ${cfg.warningEscalation.action}${cfg.warningEscalation.action === 'mute' ? ` for ${cfg.warningEscalation.durationMinutes} min` : ''}` : 'off'}. Use /warnlimit <1-10> <ban|mute> [minutes], or /warnlimit off.`);
+  if (args === 'off') cfg.warningEscalation = { ...cfg.warningEscalation, count: 0 };
+  else {
+    const m = args.match(/^(\d+)\s+(ban|mute)(?:\s+(\d+))?$/);
+    if (!m) return ctx.reply('Use /warnlimit <1-10> <ban|mute> [minutes], e.g. /warnlimit 3 mute 30, or /warnlimit off.');
+    const count = Number(m[1]), durationMinutes = Number(m[3] || 10);
+    if (count < 1 || count > 10 || (m[2] === 'mute' && (durationMinutes < 1 || durationMinutes > 10080))) return ctx.reply('Warnings 1–10; mute duration 1–10080 minutes.');
+    cfg.warningEscalation = { count, action: m[2], durationMinutes };
+  }
+  saveState(); await ctx.reply(`Warning escalation updated: ${cfg.warningEscalation.count ? `${cfg.warningEscalation.count} warnings → ${cfg.warningEscalation.action}${cfg.warningEscalation.action === 'mute' ? ` for ${cfg.warningEscalation.durationMinutes} min` : ''}` : 'off'}.`);
+});
 bot.command('warn', async ctx => {
   if (!await ensureAdminCommand(ctx)) return;
   const id = targetUserId(ctx);
   if (!id) return ctx.reply('Kisi user ke message par reply karke /warn bhejo.');
   const cfg = chatSettings(ctx.chat.id);
   cfg.warnings[id] = (cfg.warnings[id] || 0) + 1;
-  const count = cfg.warnings[id];
+  const count = cfg.warnings[id], escalation = cfg.warningEscalation;
   saveState();
-  if (count >= 3) {
-    try { await ctx.telegram.banChatMember(ctx.chat.id, Number(id)); cfg.warnings[id] = 0; saveState(); await ctx.reply(`3 warnings complete: user ${id} ban kar diya.`); }
-    catch (err) { await ctx.reply(`Warning 3/3, lekin ban nahi ho paaya: ${err.message}`); }
-  } else await logAdminAction(ctx, 'Warn user', `Target: ${id}; count: ${count}/3`); await ctx.reply(`User ${id} ko warning ${count}/3 mili.`);
+  await logAdminAction(ctx, 'Warn user', `Target: ${id}; count: ${count}${escalation.count ? `/${escalation.count}` : ''}`);
+  if (escalation.count > 0 && count >= escalation.count) {
+    try {
+      if (escalation.action === 'mute') {
+        const permissions = Object.fromEntries(MEMBER_PERMISSION_KEYS.map(key => [key, false]));
+        await ctx.telegram.restrictChatMember(ctx.chat.id, Number(id), { permissions, until_date: Math.floor(Date.now() / 1000) + escalation.durationMinutes * 60 });
+        cfg.warnings[id] = 0; saveState();
+        return ctx.reply(`User ${id} ko ${count} warnings ke baad ${escalation.durationMinutes} minute mute kar diya.`);
+      }
+      await ctx.telegram.banChatMember(ctx.chat.id, Number(id));
+      cfg.warnings[id] = 0; saveState();
+      return ctx.reply(`User ${id} ko ${count} warnings ke baad ban kar diya.`);
+    } catch (err) { return ctx.reply(`Escalation action nahi ho paaya; warning ${count} save hai: ${err.message}`); }
+  }
+  const target = escalation.count ? `${count}/${escalation.count}` : `${count}`;
+  await ctx.reply(`User ${id} ko warning ${target} mili.`);
 });
 bot.command('warnings', async ctx => {
   if (!await ensureAdminCommand(ctx)) return;
   const id = targetUserId(ctx) || getArg(ctx).split(/\s+/)[0];
   if (!id) return ctx.reply('Use: reply karke /warnings, ya /warnings <user_id>.');
-  await ctx.reply(`User ${id} warnings: ${chatSettings(ctx.chat.id).warnings[id] || 0}/3`);
+  const cfg = chatSettings(ctx.chat.id); const threshold = cfg.warningEscalation.count || 'off'; await ctx.reply(`User ${id} warnings: ${cfg.warnings[id] || 0}/${threshold}`);
 });
 bot.command('clear', async ctx => {
   if (!await ensureAdminCommand(ctx)) return;
@@ -892,7 +1357,14 @@ bot.command('autoreact', async ctx => {
   if (!await ensureAdminCommand(ctx)) return;
   const value = getArg(ctx).toLowerCase();
   if (!['on', 'off'].includes(value)) return ctx.reply('Use: /autoreact on ya /autoreact off');
-  chatSettings(ctx.chat.id).autoReact = value === 'on'; saveState(); await logAdminAction(ctx, `Auto reactions ${value}`); await ctx.reply(`Automatic emoji reactions ${value} ho gaye.`);
+  const cfg = chatSettings(ctx.chat.id); cfg.autoReact = value === 'on'; cfg.reactionMode = value === 'on' ? 'smart' : 'off'; saveState(); await logAdminAction(ctx, `Auto reactions ${value}`); await ctx.reply(`Automatic emoji reactions ${value} ho gaye.`);
+});
+bot.command('reactionmode', async ctx => {
+  const value = getArg(ctx).toLowerCase();
+  if (!['fast', 'smart', 'off'].includes(value)) return ctx.reply('Use /reactionmode fast (quick local emoji), smart (Gemini refine), or off.');
+  if (isGroup(ctx)) { if (!await requireAdmin(ctx)) return; const cfg = chatSettings(ctx.chat.id); cfg.reactionMode = value; cfg.autoReact = value !== 'off'; }
+  else userSettings(ctx.from.id).reactionMode = value;
+  saveState(); await ctx.reply(`Reaction mode ${value} set. ${value === 'smart' ? 'Gemini refinement can use one extra request per message.' : value === 'fast' ? 'Only quick local reactions will be used.' : 'Reactions are disabled for this chat.'}`);
 });
 bot.command('antilink', async ctx => {
   if (!await ensureAdminCommand(ctx)) return;
@@ -919,6 +1391,40 @@ bot.command('flood', async ctx => {
   if (parts[3]) cfg.mute = Math.min(86400, Math.max(10, Number(parts[3]) || cfg.mute));
   saveState(); await logAdminAction(ctx, `Flood guard ${cfg.enabled ? 'on' : 'off'}`, `max=${cfg.max}, window=${cfg.window}s, mute=${cfg.mute}s`);
   await ctx.reply(`Flood guard ${cfg.enabled ? 'on' : 'off'}: ${cfg.max} messages/${cfg.window}s; mute ${cfg.mute}s.`);
+});
+
+bot.command('transcribe', async ctx => {
+  const target = ctx.message.reply_to_message;
+  if (!target?.voice && !target?.audio) return ctx.reply('Kisi voice note/audio message par reply karke /transcribe bhejo.');
+  if (!await allowRequest(ctx, 'ai')) return;
+  addUsage(ctx, 'ai');
+  try { const transcript = await transcribeTelegramAudio(ctx, target); await ctx.reply(`📝 Transcript:\n${transcript}`.slice(0, 3900)); }
+  catch (err) { countError(ctx); console.error('Voice transcription failed:', err.message); await ctx.reply(`Transcription nahi ho paayi: ${err.message}`); }
+});
+bot.on('voice', async ctx => {
+  if (await applyFloodGuard(ctx)) return;
+  if (isGroup(ctx) && !addressedToSaaya(ctx)) return;
+  const requestUsage = usageFor(ctx.chat.id, ctx.from.id).user;
+  const requestLimit = chatSettings(ctx.chat.id).limits.daily;
+  if (requestUsage.ai + 2 > requestLimit) return ctx.reply(`Voice reply ko transcription aur response ke liye 2 Gemini requests chahiye; daily limit ${requestLimit} mein ab utne requests baaki nahi hain.`);
+  if (!await allowRequest(ctx, 'ai')) return;
+  addUsage(ctx, 'ai');
+  try {
+    await ctx.sendChatAction('typing');
+    const transcript = await transcribeTelegramAudio(ctx, ctx.message);
+    addUsage(ctx, 'ai');
+    if (isGroup(ctx) && chatSettings(ctx.chat.id).groupMemory !== false) {
+      const key = memoryKey(ctx), history = pruneMemory(memoryFor(ctx));
+      history.push({ role: 'user', text: transcript.slice(0, MAX_TEXT), createdAt: Date.now(), messageId: ctx.message.message_id, turnId: `voice-${ctx.message.message_id}`, speaker: ctx.from?.first_name || 'member' });
+      state.memories[key] = pruneMemory(history); saveState();
+    }
+    const answer = await askGemini(ctx, `The user sent a voice message. Transcript (respond to its meaning; do not merely repeat it):\n${transcript}`, { remember: ctx.chat.type === 'private' || isGroup(ctx), memoryUserText: transcript });
+    ctx.state.saayaReply = answer;
+    await ctx.reply(answer, { reply_to_message_id: ctx.message.message_id, allow_sending_without_reply: true });
+  } catch (err) {
+    countError(ctx); console.error('Incoming voice processing failed:', err.message);
+    await ctx.reply(`Voice note samajhne mein problem hui: ${err.message}`, { reply_to_message_id: ctx.message.message_id, allow_sending_without_reply: true });
+  }
 });
 
 bot.command('joke', ctx => {
@@ -952,13 +1458,106 @@ bot.command('memory', async ctx => {
   prefs.memory = val === 'on';
   if (val === 'off') delete state.memories[userKey(ctx)];
   saveState();
-  await ctx.reply(val === 'off' ? 'Memory off; saved DM history bhi clear kar di.' : 'Memory on. Recent DM turns context ke liye Railway storage par save honge; /memory off ya /resetmemory se control karo.');
+  await ctx.reply(val === 'off' ? 'Memory off; saved DM history bhi clear kar di.' : 'Memory on; DM conversation history is retained for 10 days. Use /memory off or /resetmemory to control it.');
 });
 bot.command('resetmemory', async ctx => {
   if (ctx.chat.type !== 'private') return ctx.reply('Memory controls sirf private DM mein available hain.');
   delete state.memories[userKey(ctx)];
   saveState();
   await ctx.reply('Tumhari saved DM conversation memory clear kar di.');
+});
+
+bot.command('groupmemory', async ctx => {
+  if (!isGroup(ctx)) return ctx.reply('Group memory setting sirf group mein use hoti hai.');
+  if (!await requireAdmin(ctx)) return;
+  const value = getArg(ctx).toLowerCase();
+  const cfg = chatSettings(ctx.chat.id);
+  if (!['on', 'off'].includes(value)) return ctx.reply(`Group memory: ${cfg.groupMemory ? 'on' : 'off'}. Use /groupmemory on|off. When enabled, Telegram-delivered group text/captions are kept for 10 days.`);
+  cfg.groupMemory = value === 'on';
+  saveState();
+  await ctx.reply(value === 'on' ? 'Group conversation memory on; text/captions Telegram delivers to the bot are kept for 10 days.' : 'Group conversation memory off. Existing history remains until 10-day expiry; use /resetgroupmemory to clear it now.');
+});
+bot.command('resetgroupmemory', async ctx => {
+  if (!isGroup(ctx)) return ctx.reply('Group memory controls sirf group mein available hain.');
+  if (!await requireAdmin(ctx)) return;
+  delete state.memories[`group:${ctx.chat.id}`];
+  saveState();
+  await ctx.reply('Is group ki saved conversation memory clear kar di.');
+});
+bot.command('memorysearch', async ctx => {
+  if (isGroup(ctx) && !await requireAdmin(ctx)) return;
+  const query = getArg(ctx).trim().toLowerCase();
+  if (query.length < 2) return ctx.reply('Use /memorysearch <keyword> (kam-se-kam 2 characters).');
+  const history = pruneMemory(state.memories[memoryKey(ctx)] || []);
+  const hits = history.filter(e => String(e.text || '').toLowerCase().includes(query)).slice(-8).reverse();
+  if (!hits.length) return ctx.reply(`Last 10 days ki memory mein “${query}” nahi mila.`);
+  const lines = hits.map(e => {
+    const date = new Intl.DateTimeFormat('en-IN', { timeZone: 'Asia/Kolkata', dateStyle: 'short', timeStyle: 'short' }).format(new Date(Number(e.createdAt) || Date.now()));
+    const who = e.role === 'user' ? (e.speaker || 'User') : BOT_NAME;
+    return `• ${date} — ${who}: ${String(e.text || '').slice(0, 240)}`;
+  });
+  await ctx.reply(`🔎 Memory matches for “${query}”\n${lines.join('\n')}`.slice(0, 3900));
+});
+bot.command('forget', async ctx => {
+  if (isGroup(ctx) && !await requireAdmin(ctx)) return;
+  const query = getArg(ctx).trim().toLowerCase();
+  if (query.length < 2) return ctx.reply('Use /forget <keyword> (kam-se-kam 2 characters). Group mein admin-only.');
+  const key = memoryKey(ctx), history = pruneMemory(state.memories[key] || []);
+  const matchingTurns = new Set(history.filter(e => String(e.text || '').toLowerCase().includes(query)).map(e => e.turnId).filter(Boolean));
+  const before = history.length;
+  const kept = history.filter(e => !String(e.text || '').toLowerCase().includes(query) && !(e.turnId && matchingTurns.has(e.turnId)));
+  state.memories[key] = kept;
+  saveState();
+  await ctx.reply(kept.length === before ? `“${query}” wali memory nahi mili.` : `“${query}” se match karne wali ${before - kept.length} memory entries hata di. Use /resetmemory or /resetgroupmemory to clear all.`);
+});
+bot.command('digest', async ctx => {
+  if (isGroup(ctx) && !await requireAdmin(ctx)) return;
+  if (isGroup(ctx) && chatSettings(ctx.chat.id).groupMemory === false) return ctx.reply('Group memory off hai; digest ke liye admin pehle /groupmemory on kare.');
+  const range = (getArg(ctx).toLowerCase() || 'today');
+  if (!['today', 'week'].includes(range)) return ctx.reply('Use /digest today or /digest week. Group mein admin-only.');
+  const history = pruneMemory(state.memories[memoryKey(ctx)] || []);
+  const now = Date.now();
+  let start;
+  if (range === 'week') start = now - 7 * 24 * 60 * 60 * 1000;
+  else { const shifted = new Date(now + 330 * 60 * 1000); start = Date.UTC(shifted.getUTCFullYear(), shifted.getUTCMonth(), shifted.getUTCDate()) - 330 * 60 * 1000; }
+  const selected = history.filter(e => Number(e.createdAt) >= start).slice(-100);
+  if (selected.length < 2) return ctx.reply(`Memory mein ${range} ka digest banane jitni conversation nahi hai.`);
+  const transcript = selected.map(e => `${e.role === 'user' ? e.speaker || 'Member' : BOT_NAME}: ${String(e.text || '').slice(0, 320)}`).join('\n').slice(-3000);
+  return runAICommand(ctx, `Write a clear, concise factual digest of this ${range} conversation. Capture decisions, tasks, unresolved questions, and important facts. Do not invent details, do not add owner name/handle unless present and relevant in the transcript, and do not turn the digest into a reply to the speaker.\nTranscript:\n${transcript}`, { remember: false });
+});
+bot.command('wishsettings', async ctx => {
+  if (!isGroup(ctx)) return ctx.reply('Per-group wish settings sirf group mein available hain.');
+  if (!await requireAdmin(ctx)) return;
+  const cfg = chatSettings(ctx.chat.id), arg = getArg(ctx).trim();
+  if (!arg) return ctx.reply(`Group wishes: times=${(cfg.wishTimes || WISH_SLOTS.map(s => `${String(s.hour).padStart(2, '0')}:${String(s.minute).padStart(2, '0')}`)).join(',')}; language=${cfg.wishLanguage || 'Hindi/Hinglish'}. Use /wishsettings times 07:00,13:00,18:00,22:30 or /wishsettings language Hindi.`);
+  const times = arg.match(/^times\s+(.+)$/i);
+  const language = arg.match(/^language\s+([\s\S]+)$/i);
+  if (/^reset$/i.test(arg)) { cfg.wishTimes = null; cfg.wishLanguage = ''; }
+  else if (times) {
+    const parts = times[1].split(',').map(x => x.trim());
+    if (parts.length !== 4 || parts.some(x => !/^(?:[01]\d|2[0-3]):[0-5]\d$/.test(x)) || new Set(parts).size !== 4) return ctx.reply('4 unique times chahiye, format: /wishsettings times 07:00,13:00,18:00,22:30 (IST). Order: morning, afternoon, evening, night.');
+    cfg.wishTimes = parts;
+  } else if (language) {
+    const requestedLanguage = language[1].trim();
+    if (!/^[\p{L}\p{M}]+(?:[ -][\p{L}\p{M}]+)*$/u.test(requestedLanguage) || requestedLanguage.length > 40) return ctx.reply('Language ka naam simple text mein do, e.g. Hindi, English, Hinglish, Punjabi.');
+    cfg.wishLanguage = requestedLanguage;
+  } else return ctx.reply('Use /wishsettings times HH:MM,HH:MM,HH:MM,HH:MM; /wishsettings language Hindi; or /wishsettings reset.');
+  saveState(); scheduleNextWish();
+  await ctx.reply(`Group wish settings saved. Times: ${(cfg.wishTimes || WISH_SLOTS.map(s => `${String(s.hour).padStart(2, '0')}:${String(s.minute).padStart(2, '0')}`)).join(',')} IST; language: ${cfg.wishLanguage || 'Hindi/Hinglish'}.`);
+});
+bot.command('wish', async ctx => {
+  if (!['private', 'group', 'supergroup'].includes(ctx.chat.type)) return ctx.reply('Scheduled wishes sirf private chats aur groups ke liye hain.');
+  if (isGroup(ctx) && !await ensureAdminCommand(ctx)) return;
+  const value = getArg(ctx).toLowerCase();
+  const recipient = state.wishRecipients[String(ctx.chat.id)] ||= { chatId: String(ctx.chat.id), type: ctx.chat.type, title: ctx.chat.title || '', enabled: true, createdAt: Date.now() };
+  if (!['on', 'off'].includes(value)) {
+    const cfg = isGroup(ctx) ? chatSettings(ctx.chat.id) : null;
+    const times = cfg?.wishTimes || WISH_SLOTS.map(s => `${String(s.hour).padStart(2, '0')}:${String(s.minute).padStart(2, '0')}`);
+    return ctx.reply(`Scheduled wishes: ${recipient.enabled === false ? 'off' : 'on'} (${times.join(', ')} IST; ${cfg?.wishLanguage || 'Hindi/Hinglish'}). Use /wish on|off. Group times/language: /wishsettings; group admins control group wishes.`);
+  }
+  recipient.enabled = value === 'on';
+  saveState(); scheduleNextWish();
+  await ctx.reply(value === 'on' ? 'Scheduled shayari/photo wishes enabled for this chat.' : 'Scheduled wishes disabled for this chat.');
 });
 
 async function runAICommand(ctx, prompt, { remember = false } = {}) {
@@ -973,9 +1572,9 @@ async function runAICommand(ctx, prompt, { remember = false } = {}) {
     const contextBudget = Math.max(0, MAX_TEXT - prompt.length - 60);
     const groupContextText = groupContext.join('\n\n').slice(0, contextBudget);
     const contextualPrompt = groupContextText ? `${prompt}\n\n[Group context]\n${groupContextText}` : prompt;
-    const reply = await askGemini(ctx, contextualPrompt, { remember });
+    const reply = await askGemini(ctx, contextualPrompt, { remember, memoryUserText: prompt });
+    ctx.state.saayaReply = reply;
     await ctx.reply(reply, { reply_to_message_id: ctx.message.message_id, allow_sending_without_reply: true });
-    await chooseGeminiReaction(ctx, prompt, reply);
   } catch (err) {
     countError(ctx);
     console.error('Gemini error:', err.message);
@@ -1037,7 +1636,7 @@ bot.on('text', async ctx => {
   const text = ctx.message.text.trim();
   if (!text || text.startsWith('/')) return;
   if (isGroup(ctx) && !addressedToSaaya(ctx)) return;
-  return runAICommand(ctx, text, { remember: ctx.chat.type === 'private' });
+  return runAICommand(ctx, text, { remember: ctx.chat.type === 'private' || isGroup(ctx) });
 });
 
 bot.catch(async (err, ctx) => {
@@ -1050,6 +1649,7 @@ bot.launch({ dropPendingUpdates: false }).then(() => {
   console.log(`${BOT_NAME} is running with Gemini (${GEMINI_MODEL}).`);
   for (const reminder of state.reminders) scheduleReminder(reminder);
   for (const pending of Object.values(state.pendingVerifications)) scheduleVerificationExpiry(pending);
+  scheduleNextWish();
 });
 process.once('SIGINT', () => bot.stop('SIGINT'));
 process.once('SIGTERM', () => bot.stop('SIGTERM'));
