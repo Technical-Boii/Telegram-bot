@@ -1646,14 +1646,25 @@ bot.catch(async (err, ctx) => {
 });
 
 // ==========================================
-// 🎵 Media Handler Setup (bot.launch से ठीक पहले)
+// 🎵 Media Handler Setup
+// Isko bot.on('text') se theek UPAR rakhna zaruri hai
+// taaki /mp3 commands pehle process ho sakein.
 // ==========================================
 const YOUTUBE_API_KEY = process.env.YOUTUBE_API_KEY; 
 setupMediaCommands(bot, YOUTUBE_API_KEY);
 
+
 // ==========================================
-// आपका Original Bot Launch Code (Gemini AI के लिए बेहद ज़रूरी)
+// Tumhara Original Text Handler (Gemini)
 // ==========================================
+bot.on('text', async ctx => {
+    const text = ctx.message.text.trim();
+    
+    // Agar text '/' se shuru hota hai, toh Gemini skip ho jayega
+    if (!text || text.startsWith('/')) return;
+    
+    // ... (Yahan tumhara baaki ka Gemini AI wala code rahega)
+
 // Long polling: run a single Railway replica for each Telegram bot token.
 bot.launch({ dropPendingUpdates: false }).then(() => {
   console.log(`${BOT_NAME} is running with Gemini (${GEMINI_MODEL}).`);
