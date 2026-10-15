@@ -1,9 +1,10 @@
-const axios = require('axios');
-const ytdl = require('ytdl-core');
-const fs = require('fs');
-const path = require('path');
+// mediaHandler.js ka naya ESM code
+import axios from 'axios';
+import ytdl from 'ytdl-core';
+import fs from 'fs';
+import path from 'path';
 
-module.exports = function(bot, YOUTUBE_API_KEY) {
+export default function setupMediaCommands(bot, YOUTUBE_API_KEY) {
 
     // YouTube API Search Function
     async function searchYouTube(query) {
@@ -35,7 +36,7 @@ module.exports = function(bot, YOUTUBE_API_KEY) {
         const videoId = video.id.videoId;
         const title = video.snippet.title;
         const videoUrl = `https://www.youtube.com/watch?v=${videoId}`;
-        const filePath = path.join('/tmp', `${videoId}.mp3`); // Railway safe storage
+        const filePath = path.join('/tmp', `${videoId}.mp3`); 
 
         await ctx.telegram.editMessageText(ctx.chat.id, statusMsg.message_id, undefined, `🎵 *${title}*\n⏳ MP3 Download ho raha hai...`, { parse_mode: 'Markdown' });
 
@@ -44,7 +45,7 @@ module.exports = function(bot, YOUTUBE_API_KEY) {
             stream.pipe(fs.createWriteStream(filePath))
                 .on('finish', async () => {
                     await ctx.replyWithAudio({ source: filePath }, { title: title, performer: "Saaya Bot" });
-                    fs.unlinkSync(filePath); // Storage clear
+                    fs.unlinkSync(filePath); 
                     ctx.telegram.deleteMessage(ctx.chat.id, statusMsg.message_id).catch(() => {});
                 })
                 .on('error', (err) => {
@@ -101,4 +102,4 @@ module.exports = function(bot, YOUTUBE_API_KEY) {
             ctx.reply(`❌ Error: ${error.message}`);
         }
     });
-};
+}
