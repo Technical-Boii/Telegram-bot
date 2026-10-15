@@ -1646,31 +1646,42 @@ bot.catch(async (err, ctx) => {
 });
 
 // ==========================================
-// 🎵 Media Handler Setup
-// Isko bot.on('text') se theek UPAR rakhna zaruri hai
-// taaki /mp3 commands pehle process ho sakein.
+// 🎵 1. Media Handler Setup (SABSE UPAR RAKHEIN)
 // ==========================================
 const YOUTUBE_API_KEY = process.env.YOUTUBE_API_KEY; 
 setupMediaCommands(bot, YOUTUBE_API_KEY);
 
 
 // ==========================================
-// Tumhara Original Text Handler (Gemini)
+// 🤖 2. Tumhara Original Text Handler (Gemini)
 // ==========================================
 bot.on('text', async ctx => {
-    const text = ctx.message.text.trim();
-    
-    // Agar text '/' se shuru hota hai, toh Gemini skip ho jayega
-    if (!text || text.startsWith('/')) return;
-    
-    // ... (Yahan tumhara baaki ka Gemini AI wala code rahega)
+  const text = ctx.message.text.trim();
+  
+  // Agar text '/' se shuru hota hai (jaise /mp3), toh ye Gemini ko skip kar dega
+  if (!text || text.startsWith('/')) return;
+  
+  // Group chat ki condition check karna
+  if (isGroup(ctx) && !addressedToSaaya(ctx)) return;
+  
+  // Gemini AI ko command bhejna
+  return runAICommand(ctx, text, { remember: ctx.chat.type === 'private' || isGroup(ctx) });
+});
 
+
+// ==========================================
+// 🚀 3. Bot Launch Code (SABSE AAKHIR ME)
+// ==========================================
 // Long polling: run a single Railway replica for each Telegram bot token.
 bot.launch({ dropPendingUpdates: false }).then(() => {
-  console.log(`${BOT_NAME} is running with Gemini (${GEMINI_MODEL}).`);
-  for (const reminder of state.reminders) scheduleReminder(reminder);
-  for (const pending of Object.values(state.pendingVerifications)) scheduleVerificationExpiry(pending);
-  scheduleNextWish();
+  console.log(`${process.env.BOT_NAME || 'Bot'} is running with Gemini.`);
+  if (typeof state !== 'undefined' && state.reminders) {
+      for (const reminder of state.reminders) scheduleReminder(reminder);
+  }
+  if (typeof state !== 'undefined' && state.pendingVerifications) {
+      for (const pending of Object.values(state.pendingVerifications)) scheduleVerificationExpiry(pending);
+  }
+  if (typeof scheduleNextWish === 'function') scheduleNextWish();
 });
 
 process.once('SIGINT', () => bot.stop('SIGINT'));
