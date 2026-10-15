@@ -12,7 +12,6 @@
   "dependencies": {
     "telegraf": "^4.16.3",
     "axios": "^1.6.8",
-    "ytdl-core": "^4.11.5"
-    
+    "@distube/ytdl-core": "^4.16.4"
   }
 }
