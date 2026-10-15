@@ -38,48 +38,21 @@ function contextEmoji(text) {
   if (/saved|set |added|deleted|removed|done|success|updated|clear kar/.test(t)) return '✅';
   return '✨';
 }
+
 const hasEmoji = /\p{Extended_Pictographic}/u;
-function setupMediaCommands(bot, apiKey) {
-  bot.use(async (ctx, next) => {
-    const match = ctx.message?.text?.match(/^\/play(?:@\w+)?(?:\s+([\s\S]+))?$/i);
-    if (!match) return next();
-    const query = String(match[1] || '').trim();
-    if (!query) return ctx.reply('🎵 Use: /play <song name>');
-    if (!apiKey) return ctx.reply('⚠️ YouTube search ke liye Railway Variables mein YOUTUBE_API_KEY add karo.');
-    const url = new URL('https://www.googleapis.com/youtube/v3/search');
-    url.searchParams.set('part', 'snippet');
-    url.searchParams.set('type', 'video');
-    url.searchParams.set('maxResults', '5');
-    url.searchParams.set('regionCode', 'IN');
-    url.searchParams.set('q', query.slice(0, 150));
-    url.searchParams.set('key', apiKey);
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 15000);
-    try {
-      const response = await fetch(url, { signal: controller.signal });
-      if (!response.ok) throw new Error(`YouTube API HTTP ${response.status}`);
-      const data = await response.json();
-      const videos = (data.items || []).filter(item => item.id?.videoId).slice(0, 5);
-      if (!videos.length) return ctx.reply(`🎵 “${query.slice(0, 120)}” ke liye koi YouTube result nahi mila.`);
-      const results = videos.map((item, i) => `${i + 1}. ${item.snippet?.title || 'Untitled'} — ${item.snippet?.channelTitle || 'YouTube'}\nhttps://www.youtube.com/watch?v=${item.id.videoId}`);
-      return ctx.reply(`🎵 YouTube search results for “${query.slice(0, 120)}”\n\n${results.join('\n\n')}`);
-    } catch (err) {
-      console.error('YouTube search failed:', err.message);
-      return ctx.reply('⚠️ YouTube search abhi kaam nahi kar rahi. API key, YouTube Data API v3 access aur quota check karo.');
-    } finally {
-      clearTimeout(timeout);
-    }
-  });
-}
 const bot = new Telegraf(TELEGRAM_BOT_TOKEN);
 const YOUTUBE_API_KEY = process.env.YOUTUBE_API_KEY;
 setupMediaCommands(bot, YOUTUBE_API_KEY);
+
 bot.use(async (ctx, next) => {
   const originalReply = ctx.reply.bind(ctx);
   ctx.reply = (text, extra) => {
-    if (typeof text === 'string' && !hasEmoji.test(text)) text = `${text} ${contextEmoji(text)}`;
+    if (typeof text === 'string' && !hasEmoji.test(text)) {
+      text = `${text} ${contextEmoji(text)}`;
+    }
     return originalReply(text, extra);
   };
+
   captureGroupText(ctx);
   await next();
 });
