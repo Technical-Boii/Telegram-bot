@@ -1,0 +1,17 @@
+{
+  "name": "saaya-telegram-bot",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "telegraf": "^4.16.3",
+    "axios": "^1.6.8",
+    "@distube/ytdl-core": "^4.16.4"
+  }
+}
