@@ -75,7 +75,7 @@ export default function setupMediaCommands(bot, YOUTUBE_API_KEY) {
 
     const cookieFile = prepareCookies();
 
-    function ytDlpBaseArgs() {
+    function ytDlpBaseArgs(includeCookies = true) {
         const args = [
             '--no-warnings',
             '--no-playlist',
@@ -83,7 +83,7 @@ export default function setupMediaCommands(bot, YOUTUBE_API_KEY) {
             '--socket-timeout', '30'
         ];
         if (ffmpegPath) args.push('--ffmpeg-location', ffmpegPath);
-        if (cookieFile) args.push('--cookies', cookieFile);
+        if (includeCookies && cookieFile) args.push('--cookies', cookieFile);
         return args;
     }
 
@@ -185,10 +185,12 @@ export default function setupMediaCommands(bot, YOUTUBE_API_KEY) {
     }
 
     async function runYtDlp(videoUrl, args = []) {
-        const attempts = [args];
+        const attempts = [{ args, includeCookies: Boolean(cookieFile), label: 'default client with cookies' }];
         if (!args.includes('--extractor-args')) {
-            for (const client of ['web_safari', 'mweb', 'ios']) {
-                attempts.push([...args, '--extractor-args', `youtube:player_client=${client}`]);
+            attempts.push({ args: [...args, '--extractor-args', 'youtube:player_client=web_safari'], includeCookies: Boolean(cookieFile), label: 'web_safari client with cookies' });
+            if (cookieFile) {
+                attempts.push({ args, includeCookies: false, label: 'default client without cookies' });
+                attempts.push({ args: [...args, '--extractor-args', 'youtube:player_client=web_safari'], includeCookies: false, label: 'web_safari client without cookies' });
             }
         }
 
@@ -197,8 +199,8 @@ export default function setupMediaCommands(bot, YOUTUBE_API_KEY) {
             const attempt = attempts[attemptIndex];
             try {
                 const output = await ytDlpWrap.execPromise([
-                    ...ytDlpBaseArgs(),
-                    ...attempt,
+                    ...ytDlpBaseArgs(attempt.includeCookies),
+                    ...attempt.args,
                     videoUrl
                 ]);
                 return typeof output === 'string' ? output : String(output?.stdout || '');
@@ -206,7 +208,7 @@ export default function setupMediaCommands(bot, YOUTUBE_API_KEY) {
                 lastError = error;
                 const canContinue = attemptIndex < attempts.length - 1 && canRetryWithAlternateClient(error);
                 if (!canContinue) throw error;
-                console.log(`yt-dlp YouTube client attempt ${attemptIndex + 1} failed; trying fallback client.`);
+                console.log(`yt-dlp ${attempt.label} failed; trying next fallback.`);
             }
         }
         throw lastError;
