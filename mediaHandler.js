@@ -1,6 +1,7 @@
 // mediaHandler.js
 import axios from 'axios';
-import ytDlp from 'yt-dlp-exec';
+import YTDlpWrapModule from 'yt-dlp-wrap';
+const YTDlpWrap = YTDlpWrapModule.default || YTDlpWrapModule;
 import ffmpegPath from 'ffmpeg-static';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -9,6 +10,8 @@ export default function setupMediaCommands(bot, YOUTUBE_API_KEY) {
     const searchCache = new Map();
     const SEARCH_CACHE_TTL = 10 * 60 * 1000;
     const cookieFilePath = path.join('/tmp', `saaya-youtube-cookies-${process.pid}.txt`);
+    const ytDlpBinary = path.resolve(process.env.YTDLP_BINARY_PATH || './bin/yt-dlp');
+    const ytDlpWrap = new YTDlpWrap(ytDlpBinary);
 
     function removeFile(filePath) {
         if (!filePath) return;
@@ -72,17 +75,17 @@ export default function setupMediaCommands(bot, YOUTUBE_API_KEY) {
 
     const cookieFile = prepareCookies();
 
-    function ytDlpOptions(extra = {}) {
-        return {
-            noWarnings: true,
-            noCallHome: true,
-            noPlaylist: true,
-            retries: 2,
-            socketTimeout: 30,
-            ...(ffmpegPath ? { ffmpegLocation: ffmpegPath } : {}),
-            ...(cookieFile ? { cookies: cookieFile } : {}),
-            ...extra
-        };
+    function ytDlpBaseArgs() {
+        const args = [
+            '--no-warnings',
+            '--no-call-home',
+            '--no-playlist',
+            '--retries', '2',
+            '--socket-timeout', '30'
+        ];
+        if (ffmpegPath) args.push('--ffmpeg-location', ffmpegPath);
+        if (cookieFile) args.push('--cookies', cookieFile);
+        return args;
     }
 
     function isYouTubeUrl(value) {
@@ -177,26 +180,29 @@ export default function setupMediaCommands(bot, YOUTUBE_API_KEY) {
         ).catch(() => {});
     }
 
-    async function runYtDlp(videoUrl, options) {
-        return ytDlp(videoUrl, ytDlpOptions(options));
+    async function runYtDlp(videoUrl, args = []) {
+        const output = await ytDlpWrap.execPromise([
+            ...ytDlpBaseArgs(),
+            ...args,
+            videoUrl
+        ]);
+        return typeof output === 'string' ? output : String(output?.stdout || '');
     }
 
     async function getVideoInfo(videoUrl) {
-        const info = await runYtDlp(videoUrl, {
-            dumpSingleJson: true,
-            skipDownload: true
-        });
-        if (typeof info === 'string') return JSON.parse(info);
-        return info;
+        const output = await runYtDlp(videoUrl, ['--dump-single-json', '--skip-download']);
+        const jsonStart = output.indexOf('{');
+        if (jsonStart < 0) throw new Error('yt-dlp metadata nahi de saka.');
+        return JSON.parse(output.slice(jsonStart));
     }
 
-    async function downloadToFile(videoUrl, filePath, options) {
-        await runYtDlp(videoUrl, {
-            output: filePath,
-            forceOverwrites: true,
-            noPart: true,
-            ...options
-        });
+    async function downloadToFile(videoUrl, filePath, args = []) {
+        await runYtDlp(videoUrl, [
+            '--output', filePath,
+            '--force-overwrites',
+            '--no-part',
+            ...args
+        ]);
         if (!fs.existsSync(filePath)) throw new Error('yt-dlp ne output file create nahi ki.');
     }
 
@@ -217,11 +223,11 @@ export default function setupMediaCommands(bot, YOUTUBE_API_KEY) {
                 ).catch(() => {});
             }
 
-            await downloadToFile(videoUrl, filePath, {
-                extractAudio: true,
-                audioFormat: 'mp3',
-                audioQuality: '0'
-            });
+            await downloadToFile(videoUrl, filePath, [
+                '--extract-audio',
+                '--audio-format', 'mp3',
+                '--audio-quality', '0'
+            ]);
 
             if (statusMsg) {
                 await ctx.telegram.editMessageText(
@@ -263,10 +269,10 @@ export default function setupMediaCommands(bot, YOUTUBE_API_KEY) {
                 ).catch(() => {});
             }
 
-            await downloadToFile(videoUrl, filePath, {
-                format: 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
-                mergeOutputFormat: 'mp4'
-            });
+            await downloadToFile(videoUrl, filePath, [
+                '--format', 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
+                '--merge-output-format', 'mp4'
+            ]);
             const fileSizeInMB = fs.statSync(filePath).size / (1024 * 1024);
             if (fileSizeInMB > 50) {
                 await ctx.reply(`⚠️ Video ${fileSizeInMB.toFixed(2)}MB ka hai. Telegram limit ke karan 50MB se badi video nahi bhej sakta.`);
