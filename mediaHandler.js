@@ -3,10 +3,9 @@ const ytdl = require('ytdl-core');
 const fs = require('fs');
 const path = require('path');
 
-// Yeh function humari main file (index.js) me export hoga
 module.exports = function(bot, YOUTUBE_API_KEY) {
 
-    // YouTube V3 API se video search karne ka function
+    // YouTube API Search Function
     async function searchYouTube(query) {
         try {
             const url = `https://www.googleapis.com/youtube/v3/search?part=snippet&maxResults=1&q=${encodeURIComponent(query)}&type=video&key=${YOUTUBE_API_KEY}`;
@@ -21,58 +20,51 @@ module.exports = function(bot, YOUTUBE_API_KEY) {
         }
     }
 
-    // ==========================================
-    // 🎵 /mp3 Command Handler
-    // ==========================================
-    bot.onText(/\/mp3 (.+)/, async (msg, match) => {
-        const chatId = msg.chat.id;
-        const query = match[1]; // User ne jo gaane ka naam likha hai
+    // 🎵 /mp3 Command
+    bot.command('mp3', async (ctx) => {
+        const query = ctx.message.text.replace('/mp3', '').trim();
+        if (!query) return ctx.reply("❌ Kripya gaane ka naam bhi likhein. Jaise: /mp3 rafta rafta sanam");
 
-        const statusMsg = await bot.sendMessage(chatId, `🔍 *${query}* search kar raha hoon...`, {parse_mode: 'Markdown'});
+        const statusMsg = await ctx.reply(`🔍 *${query}* search kar raha hoon...`, { parse_mode: 'Markdown' });
 
         const video = await searchYouTube(query);
         if (!video) {
-            return bot.editMessageText("❌ Gaana nahi mila ya YouTube API me koi dikkat hai.", { chat_id: chatId, message_id: statusMsg.message_id });
+            return ctx.telegram.editMessageText(ctx.chat.id, statusMsg.message_id, undefined, "❌ Gaana nahi mila ya API me problem hai.");
         }
 
         const videoId = video.id.videoId;
         const title = video.snippet.title;
         const videoUrl = `https://www.youtube.com/watch?v=${videoId}`;
-        const filePath = path.join('/tmp', `${videoId}.mp3`); // Railway me /tmp folder safe hota hai
+        const filePath = path.join('/tmp', `${videoId}.mp3`); // Railway safe storage
 
-        await bot.editMessageText(`🎵 *${title}*\n⏳ MP3 Download ho raha hai, kripya thoda wait karein...`, { chat_id: chatId, message_id: statusMsg.message_id, parse_mode: 'Markdown' });
+        await ctx.telegram.editMessageText(ctx.chat.id, statusMsg.message_id, undefined, `🎵 *${title}*\n⏳ MP3 Download ho raha hai...`, { parse_mode: 'Markdown' });
 
         try {
             const stream = ytdl(videoUrl, { filter: 'audioonly', quality: 'highestaudio' });
             stream.pipe(fs.createWriteStream(filePath))
                 .on('finish', async () => {
-                    // Download complete hone par Telegram me bhejna
-                    await bot.sendAudio(chatId, fs.createReadStream(filePath), { title: title, performer: "Saaya Bot" });
-                    
-                    // Bhejne ke baad Railway ki storage khali karna (Zaruri hai!)
-                    fs.unlinkSync(filePath);
-                    bot.deleteMessage(chatId, statusMsg.message_id);
+                    await ctx.replyWithAudio({ source: filePath }, { title: title, performer: "Saaya Bot" });
+                    fs.unlinkSync(filePath); // Storage clear
+                    ctx.telegram.deleteMessage(ctx.chat.id, statusMsg.message_id).catch(() => {});
                 })
                 .on('error', (err) => {
-                    bot.sendMessage(chatId, `❌ Download fail ho gaya: ${err.message}`);
+                    ctx.reply(`❌ Download error: ${err.message}`);
                 });
         } catch (error) {
-            bot.sendMessage(chatId, `❌ Error: ${error.message}`);
+            ctx.reply(`❌ Error: ${error.message}`);
         }
     });
 
-    // ==========================================
-    // 🎬 /mp4 Command Handler
-    // ==========================================
-    bot.onText(/\/mp4 (.+)/, async (msg, match) => {
-        const chatId = msg.chat.id;
-        const query = match[1]; 
+    // 🎬 /mp4 Command
+    bot.command('mp4', async (ctx) => {
+        const query = ctx.message.text.replace('/mp4', '').trim();
+        if (!query) return ctx.reply("❌ Kripya video ka naam likhein. Jaise: /mp4 funny cat");
 
-        const statusMsg = await bot.sendMessage(chatId, `🔍 *${query}* video search kar raha hoon...`, {parse_mode: 'Markdown'});
+        const statusMsg = await ctx.reply(`🔍 *${query}* video search kar raha hoon...`, { parse_mode: 'Markdown' });
 
         const video = await searchYouTube(query);
         if (!video) {
-            return bot.editMessageText("❌ Video nahi mila.", { chat_id: chatId, message_id: statusMsg.message_id });
+            return ctx.telegram.editMessageText(ctx.chat.id, statusMsg.message_id, undefined, "❌ Video nahi mila.");
         }
 
         const videoId = video.id.videoId;
@@ -80,37 +72,33 @@ module.exports = function(bot, YOUTUBE_API_KEY) {
         const videoUrl = `https://www.youtube.com/watch?v=${videoId}`;
         const filePath = path.join('/tmp', `${videoId}.mp4`);
 
-        await bot.editMessageText(`🎬 *${title}*\n⏳ Video Download ho raha hai (Isme thoda time lag sakta hai)...`, { chat_id: chatId, message_id: statusMsg.message_id, parse_mode: 'Markdown' });
+        await ctx.telegram.editMessageText(ctx.chat.id, statusMsg.message_id, undefined, `🎬 *${title}*\n⏳ Video Download ho raha hai (Isme time lag sakta hai)...`, { parse_mode: 'Markdown' });
 
         try {
-            // Video and Audio format dono chahiye
             const stream = ytdl(videoUrl, { filter: 'videoandaudio', quality: 'highest' });
             stream.pipe(fs.createWriteStream(filePath))
                 .on('finish', async () => {
                     try {
-                        // File size check karna (50MB Limit ke liye)
                         const stats = fs.statSync(filePath);
                         const fileSizeInMB = stats.size / (1024 * 1024);
 
                         if (fileSizeInMB > 50) {
-                            await bot.sendMessage(chatId, `⚠️ *Sorry!* Video ka size ${fileSizeInMB.toFixed(2)}MB hai. Telegram standard bots se sirf 50MB tak ki files bhej sakte hain.`, {parse_mode: 'Markdown'});
+                            await ctx.reply(`⚠️ *Sorry!* Video ka size ${fileSizeInMB.toFixed(2)}MB hai. Telegram limits ke karan main sirf 50MB tak bhej sakta hoon.`, { parse_mode: 'Markdown' });
                         } else {
-                            await bot.sendVideo(chatId, fs.createReadStream(filePath), { caption: `🎬 ${title}` });
+                            await ctx.replyWithVideo({ source: filePath }, { caption: `🎬 ${title}` });
                         }
                     } catch (uploadErr) {
-                        bot.sendMessage(chatId, `❌ Bhejne me problem aayi: ${uploadErr.message}`);
+                        ctx.reply(`❌ Bhejne me problem: ${uploadErr.message}`);
                     } finally {
-                        // Har haal me file delete karni hai taaki server ka space na bhare
                         if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
-                        bot.deleteMessage(chatId, statusMsg.message_id);
+                        ctx.telegram.deleteMessage(ctx.chat.id, statusMsg.message_id).catch(() => {});
                     }
                 })
                 .on('error', (err) => {
-                    bot.sendMessage(chatId, `❌ Video download fail: ${err.message}`);
+                    ctx.reply(`❌ Download error: ${err.message}`);
                 });
         } catch (error) {
-            bot.sendMessage(chatId, `❌ Error: ${error.message}`);
+            ctx.reply(`❌ Error: ${error.message}`);
         }
     });
 };
-
