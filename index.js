@@ -1,6 +1,7 @@
 import { Telegraf } from 'telegraf';
 import fs from 'node:fs';
 import path from 'node:path';
+import setupMediaCommands from './mediaHandler.js';
 
 const {
   TELEGRAM_BOT_TOKEN,
