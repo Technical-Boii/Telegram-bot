@@ -40,21 +40,91 @@ export default function setupMediaCommands(bot, YOUTUBE_API_KEY) {
 
         await ctx.telegram.editMessageText(ctx.chat.id, statusMsg.message_id, undefined, `🎵 *${title}*\n⏳ MP3 Download ho raha hai...`, { parse_mode: 'Markdown' });
 
+        await ctx.telegram.editMessageText(
+    ctx.chat.id,
+    statusMsg.message_id,
+    undefined,
+    `🎵 *${title}*\n⏳ MP3 Download ho raha hai...`,
+    { parse_mode: 'Markdown' }
+);
+
+// YAHAN se naya code paste karein
+try {
+    const stream = ytdl(videoUrl, {
+        filter: 'audioonly',
+        quality: 'highestaudio'
+    });
+
+    const output = fs.createWriteStream(filePath);
+
+    stream.on('error', async (err) => {
+        console.error('YouTube download error:', err);
+
+        if (fs.existsSync(filePath)) {
+            fs.unlinkSync(filePath);
+        }
+
+        await ctx.telegram.editMessageText(
+            ctx.chat.id,
+            statusMsg.message_id,
+            undefined,
+            `❌ MP3 download nahi ho saka: ${err.message}`
+        ).catch(() => {});
+    });
+
+    output.on('error', async (err) => {
+        console.error('File write error:', err);
+
+        if (fs.existsSync(filePath)) {
+            fs.unlinkSync(filePath);
+        }
+
+        await ctx.telegram.editMessageText(
+            ctx.chat.id,
+            statusMsg.message_id,
+            undefined,
+            `❌ Audio file save nahi ho saki: ${err.message}`
+        ).catch(() => {});
+    });
+
+    output.on('finish', async () => {
         try {
-            const stream = ytdl(videoUrl, { filter: 'audioonly', quality: 'highestaudio' });
-            stream.pipe(fs.createWriteStream(filePath))
-                .on('finish', async () => {
-                    await ctx.replyWithAudio({ source: filePath }, { title: title, performer: "Saaya Bot" });
-                    fs.unlinkSync(filePath); 
-                    ctx.telegram.deleteMessage(ctx.chat.id, statusMsg.message_id).catch(() => {});
-                })
-                .on('error', (err) => {
-                    ctx.reply(`❌ Download error: ${err.message}`);
-                });
-        } catch (error) {
-            ctx.reply(`❌ Error: ${error.message}`);
+            await ctx.replyWithAudio(
+                { source: filePath },
+                {
+                    title: title,
+                    performer: 'Saaya Bot'
+                }
+            );
+
+            await ctx.telegram.deleteMessage(
+                ctx.chat.id,
+                statusMsg.message_id
+            ).catch(() => {});
+        } catch (err) {
+            console.error('Telegram audio upload error:', err);
+            await ctx.reply(
+                `❌ Audio Telegram par bhejne me problem: ${err.message}`
+            );
+        } finally {
+            if (fs.existsSync(filePath)) {
+                fs.unlinkSync(filePath);
+            }
         }
     });
+
+    stream.pipe(output);
+
+} catch (error) {
+    console.error('MP3 setup error:', error);
+
+    await ctx.telegram.editMessageText(
+        ctx.chat.id,
+        statusMsg.message_id,
+        undefined,
+        `❌ MP3 download error: ${error.message}`
+    ).catch(() => {});
+}
 
     // 🎬 /mp4 Command
     bot.command('mp4', async (ctx) => {
