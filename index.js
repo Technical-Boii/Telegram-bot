@@ -1645,6 +1645,15 @@ bot.catch(async (err, ctx) => {
   await notifyOwnerError('Telegram update handler', ctx?.chat?.id);
 });
 
+// ==========================================
+// 🎵 Media Handler Setup (bot.launch से ठीक पहले)
+// ==========================================
+const YOUTUBE_API_KEY = process.env.YOUTUBE_API_KEY; 
+setupMediaCommands(bot, YOUTUBE_API_KEY);
+
+// ==========================================
+// आपका Original Bot Launch Code (Gemini AI के लिए बेहद ज़रूरी)
+// ==========================================
 // Long polling: run a single Railway replica for each Telegram bot token.
 bot.launch({ dropPendingUpdates: false }).then(() => {
   console.log(`${BOT_NAME} is running with Gemini (${GEMINI_MODEL}).`);
@@ -1652,29 +1661,6 @@ bot.launch({ dropPendingUpdates: false }).then(() => {
   for (const pending of Object.values(state.pendingVerifications)) scheduleVerificationExpiry(pending);
   scheduleNextWish();
 });
-process.once('SIGINT', () => bot.stop('SIGINT'));
-process.once('SIGTERM', () => bot.stop('SIGTERM'));
-
-// ==========================================
-// 🎵 Media Handler Setup (bot.launch se theek pehle)
-// ==========================================
-const YOUTUBE_API_KEY = process.env.YOUTUBE_API_KEY; 
-const setupMediaCommands = require('./mediaHandler.js');
-setupMediaCommands(bot, YOUTUBE_API_KEY);
-
-// ==========================================
-// Tumhara Original Bot Launch Code
-// ==========================================
-bot.launch({ dropPendingUpdates: false }).then(() => {
-  console.log(`${process.env.BOT_NAME || 'Bot'} is running.`);
-  // Note: Agar tumhare code me state.reminders defined nahi hai, toh unhe comment kar dena
-  if (typeof state !== 'undefined') {
-      if (state.reminders) for (const reminder of state.reminders) scheduleReminder(reminder);
-      if (state.pendingVerifications) for (const pending of Object.values(state.pendingVerifications)) scheduleVerificationExpiry(pending);
-  }
-  if (typeof scheduleNextWish === 'function') scheduleNextWish();
-});
 
 process.once('SIGINT', () => bot.stop('SIGINT'));
 process.once('SIGTERM', () => bot.stop('SIGTERM'));
-
