@@ -1,23 +1,14 @@
 // mediaHandler.js
 import axios from 'axios';
-import ytdl from '@distube/ytdl-core';
+import ytDlp from 'yt-dlp-exec';
+import ffmpegPath from 'ffmpeg-static';
 import fs from 'node:fs';
 import path from 'node:path';
 
 export default function setupMediaCommands(bot, YOUTUBE_API_KEY) {
-    let youtubeAgent;
-    if (process.env.YOUTUBE_COOKIES) {
-        try {
-            const cookies = JSON.parse(process.env.YOUTUBE_COOKIES);
-            youtubeAgent = ytdl.createAgent(cookies);
-            console.log('YouTube cookies successfully loaded.');
-        } catch (error) {
-            console.error('YouTube cookies parse error:', error.message);
-        }
-    }
-
     const searchCache = new Map();
     const SEARCH_CACHE_TTL = 10 * 60 * 1000;
+    const cookieFilePath = path.join('/tmp', `saaya-youtube-cookies-${process.pid}.txt`);
 
     function removeFile(filePath) {
         if (!filePath) return;
@@ -28,8 +19,79 @@ export default function setupMediaCommands(bot, YOUTUBE_API_KEY) {
         }
     }
 
-    function youtubeOptions(extra = {}) {
-        return youtubeAgent ? { ...extra, agent: youtubeAgent } : extra;
+    function prepareCookies() {
+        const raw = String(process.env.YOUTUBE_COOKIES || '').trim();
+        if (!raw) return null;
+
+        try {
+            if (raw.startsWith('# Netscape HTTP Cookie File')) {
+                fs.writeFileSync(cookieFilePath, raw, { mode: 0o600 });
+                console.log('YouTube cookies successfully loaded.');
+                return cookieFilePath;
+            }
+
+            const parsed = JSON.parse(raw);
+            const cookies = Array.isArray(parsed) ? parsed : parsed.cookies;
+            if (!Array.isArray(cookies) || !cookies.length) throw new Error('Cookie JSON must be an array.');
+
+            const lines = [
+                '# Netscape HTTP Cookie File',
+                '# This file is generated from YOUTUBE_COOKIES.',
+                ''
+            ];
+            for (const cookie of cookies) {
+                if (!cookie?.name || cookie.value == null) continue;
+                const domain = String(cookie.domain || cookie.host || '.youtube.com');
+                const includeSubdomains = cookie.hostOnly ? 'FALSE' : 'TRUE';
+                const cookiePath = String(cookie.path || '/');
+                const secure = cookie.secure ? 'TRUE' : 'FALSE';
+                const expires = cookie.session
+                    ? 0
+                    : Math.floor(Number(cookie.expirationDate || cookie.expires || 0));
+                lines.push([
+                    domain,
+                    includeSubdomains,
+                    cookiePath,
+                    secure,
+                    Number.isFinite(expires) ? expires : 0,
+                    String(cookie.name),
+                    String(cookie.value)
+                ].join('\t'));
+            }
+
+            if (lines.length <= 3) throw new Error('No usable cookies found.');
+            fs.writeFileSync(cookieFilePath, `${lines.join('\n')}\n`, { mode: 0o600 });
+            console.log('YouTube cookies successfully loaded.');
+            return cookieFilePath;
+        } catch (error) {
+            console.error('YouTube cookies parse error:', error.message);
+            removeFile(cookieFilePath);
+            return null;
+        }
+    }
+
+    const cookieFile = prepareCookies();
+
+    function ytDlpOptions(extra = {}) {
+        return {
+            noWarnings: true,
+            noCallHome: true,
+            noPlaylist: true,
+            retries: 2,
+            socketTimeout: 30,
+            ...(ffmpegPath ? { ffmpegLocation: ffmpegPath } : {}),
+            ...(cookieFile ? { cookies: cookieFile } : {}),
+            ...extra
+        };
+    }
+
+    function isYouTubeUrl(value) {
+        try {
+            const url = new URL(String(value || '').trim());
+            return /(^|\.)youtube\.com$/i.test(url.hostname) || url.hostname === 'youtu.be';
+        } catch {
+            return false;
+        }
     }
 
     async function searchYouTube(query, maxResults = 5) {
@@ -115,29 +177,35 @@ export default function setupMediaCommands(bot, YOUTUBE_API_KEY) {
         ).catch(() => {});
     }
 
-    async function downloadToFile(videoUrl, filePath, options) {
-        const stream = ytdl(videoUrl, youtubeOptions(options));
-        const output = fs.createWriteStream(filePath);
-        await new Promise((resolve, reject) => {
-            let settled = false;
-            const finish = error => {
-                if (settled) return;
-                settled = true;
-                error ? reject(error) : resolve();
-            };
-            stream.once('error', finish);
-            output.once('error', finish);
-            output.once('finish', () => finish());
-            stream.pipe(output);
+    async function runYtDlp(videoUrl, options) {
+        return ytDlp(videoUrl, ytDlpOptions(options));
+    }
+
+    async function getVideoInfo(videoUrl) {
+        const info = await runYtDlp(videoUrl, {
+            dumpSingleJson: true,
+            skipDownload: true
         });
+        if (typeof info === 'string') return JSON.parse(info);
+        return info;
+    }
+
+    async function downloadToFile(videoUrl, filePath, options) {
+        await runYtDlp(videoUrl, {
+            output: filePath,
+            forceOverwrites: true,
+            noPart: true,
+            ...options
+        });
+        if (!fs.existsSync(filePath)) throw new Error('yt-dlp ne output file create nahi ki.');
     }
 
     async function sendAudio(ctx, videoUrl, statusMsg = null) {
         let filePath = null;
         try {
-            const info = await ytdl.getInfo(videoUrl, youtubeAgent ? { agent: youtubeAgent } : undefined);
-            const title = String(info.videoDetails?.title || 'YouTube Audio').slice(0, 180);
-            const performer = String(info.videoDetails?.author?.name || 'YouTube').slice(0, 100);
+            const info = await getVideoInfo(videoUrl);
+            const title = String(info?.title || 'YouTube Audio').slice(0, 180);
+            const performer = String(info?.uploader || info?.channel || 'YouTube').slice(0, 100);
             filePath = path.join('/tmp', `saaya-${Date.now()}-${Math.random().toString(36).slice(2)}.mp3`);
 
             if (statusMsg) {
@@ -149,7 +217,11 @@ export default function setupMediaCommands(bot, YOUTUBE_API_KEY) {
                 ).catch(() => {});
             }
 
-            await downloadToFile(videoUrl, filePath, { quality: 'highestaudio', filter: 'audioonly' });
+            await downloadToFile(videoUrl, filePath, {
+                extractAudio: true,
+                audioFormat: 'mp3',
+                audioQuality: '0'
+            });
 
             if (statusMsg) {
                 await ctx.telegram.editMessageText(
@@ -178,8 +250,8 @@ export default function setupMediaCommands(bot, YOUTUBE_API_KEY) {
     async function sendVideo(ctx, videoUrl, statusMsg = null) {
         let filePath = null;
         try {
-            const info = await ytdl.getInfo(videoUrl, youtubeAgent ? { agent: youtubeAgent } : undefined);
-            const title = String(info.videoDetails?.title || 'YouTube Video').slice(0, 180);
+            const info = await getVideoInfo(videoUrl);
+            const title = String(info?.title || 'YouTube Video').slice(0, 180);
             filePath = path.join('/tmp', `saaya-${Date.now()}-${Math.random().toString(36).slice(2)}.mp4`);
 
             if (statusMsg) {
@@ -191,7 +263,10 @@ export default function setupMediaCommands(bot, YOUTUBE_API_KEY) {
                 ).catch(() => {});
             }
 
-            await downloadToFile(videoUrl, filePath, { filter: 'videoandaudio', quality: 'highest' });
+            await downloadToFile(videoUrl, filePath, {
+                format: 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
+                mergeOutputFormat: 'mp4'
+            });
             const fileSizeInMB = fs.statSync(filePath).size / (1024 * 1024);
             if (fileSizeInMB > 50) {
                 await ctx.reply(`⚠️ Video ${fileSizeInMB.toFixed(2)}MB ka hai. Telegram limit ke karan 50MB se badi video nahi bhej sakta.`);
@@ -235,7 +310,7 @@ export default function setupMediaCommands(bot, YOUTUBE_API_KEY) {
     bot.hears(/^\/mp3(?:@\w+)?(?:\s|$)/i, async ctx => {
         const query = String(ctx.message?.text || '').replace(/^\/mp3(?:@\w+)?/i, '').trim();
         if (!query) return ctx.reply('❌ Gaane ka naam likho. Jaise: /mp3 tum hi ho');
-        if (ytdl.validateURL(query)) {
+        if (isYouTubeUrl(query)) {
             const statusMsg = await ctx.reply('⏳ YouTube audio process ho raha hai...');
             return sendAudio(ctx, query, statusMsg);
         }
@@ -245,7 +320,7 @@ export default function setupMediaCommands(bot, YOUTUBE_API_KEY) {
     bot.hears(/^\/mp4(?:@\w+)?(?:\s|$)/i, async ctx => {
         const query = String(ctx.message?.text || '').replace(/^\/mp4(?:@\w+)?/i, '').trim();
         if (!query) return ctx.reply('❌ Video ka naam likho. Jaise: /mp4 funny cat');
-        if (ytdl.validateURL(query)) {
+        if (isYouTubeUrl(query)) {
             const statusMsg = await ctx.reply('⏳ YouTube video process ho raha hai...');
             return sendVideo(ctx, query, statusMsg);
         }
@@ -255,7 +330,7 @@ export default function setupMediaCommands(bot, YOUTUBE_API_KEY) {
     bot.hears(/^\/play(?:@\w+)?(?:\s|$)/i, async ctx => {
         const query = String(ctx.message?.text || '').replace(/^\/play(?:@\w+)?/i, '').trim();
         if (!query) return ctx.reply('❌ Gaane ka naam likho. Jaise: /play kesariya');
-        if (ytdl.validateURL(query)) {
+        if (isYouTubeUrl(query)) {
             const statusMsg = await ctx.reply('⏳ YouTube audio process ho raha hai...');
             return sendAudio(ctx, query, statusMsg);
         }
@@ -273,14 +348,14 @@ export default function setupMediaCommands(bot, YOUTUBE_API_KEY) {
         return sendAudio(ctx, resultUrl(results[0]), statusMsg);
     });
 
-    // Direct YouTube URL -> MP3 feature. This does not use YouTube API search.
     async function handleYouTubeUrl(ctx, text) {
         const videoUrl = String(text || '').trim();
-        if (!ytdl.validateURL(videoUrl)) return false;
+        if (!isYouTubeUrl(videoUrl)) return false;
         const statusMsg = await ctx.reply('⏳ YouTube audio process ho raha hai...');
         await sendAudio(ctx, videoUrl, statusMsg);
         return true;
     }
 
+    process.once('exit', () => removeFile(cookieFile));
     return { handleYouTubeUrl };
 }
