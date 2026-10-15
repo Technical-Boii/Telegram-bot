@@ -181,17 +181,20 @@ export default function setupMediaCommands(bot, YOUTUBE_API_KEY) {
 
     function canRetryWithAlternateClient(error) {
         const message = String(error?.message || error || '');
-        return /page needs to be reloaded|playable formats|sign in|po token|http error 429/i.test(message);
+        return /page needs to be reloaded|playable formats|requested format is not available|sign in|po token|http error 429/i.test(message);
     }
 
     async function runYtDlp(videoUrl, args = []) {
         const attempts = [args];
         if (!args.includes('--extractor-args')) {
-            attempts.push([...args, '--extractor-args', 'youtube:player_client=android_vr']);
+            for (const client of ['web_safari', 'mweb', 'ios']) {
+                attempts.push([...args, '--extractor-args', `youtube:player_client=${client}`]);
+            }
         }
 
         let lastError;
-        for (const attempt of attempts) {
+        for (let attemptIndex = 0; attemptIndex < attempts.length; attemptIndex++) {
+            const attempt = attempts[attemptIndex];
             try {
                 const output = await ytDlpWrap.execPromise([
                     ...ytDlpBaseArgs(),
@@ -201,8 +204,9 @@ export default function setupMediaCommands(bot, YOUTUBE_API_KEY) {
                 return typeof output === 'string' ? output : String(output?.stdout || '');
             } catch (error) {
                 lastError = error;
-                if (!canRetryWithAlternateClient(error) || attempt !== attempts[0]) throw error;
-                console.warn('yt-dlp default YouTube client failed; retrying with android_vr client.');
+                const canContinue = attemptIndex < attempts.length - 1 && canRetryWithAlternateClient(error);
+                if (!canContinue) throw error;
+                console.log(`yt-dlp YouTube client attempt ${attemptIndex + 1} failed; trying fallback client.`);
             }
         }
         throw lastError;
